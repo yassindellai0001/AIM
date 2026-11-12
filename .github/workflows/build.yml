@@ -13,7 +13,7 @@ jobs:
         Start-Process -FilePath ".\opencv.exe" -ArgumentList "-o`"C:\OpenCV`" -y" -Wait
         
     - name: Configure CMake
-      run: cmake -B build -S . -DOpenCV_DIR="C:/OpenCV/opencv/build"
+      run: cmake -B build -S . -DOpenCV_DIR="C:/OpenCV/opencv/build/x64/vc16/lib"
       
     - name: Build App
       run: cmake --build build --config Release
