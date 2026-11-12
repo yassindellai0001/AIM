@@ -18,9 +18,9 @@ jobs:
     - name: Build App
       run: cmake --build build --config Release
       
-    - name: Download AI Model
+    - name: Download AI Model (Working Version)
       run: |
-        curl.exe -L -o build/Release/yolov8n.onnx "https://huggingface.co/Ultralytics/YOLOv8/resolve/main/yolov8n.onnx"
+        curl.exe -L -o build/Release/yolov8n.onnx "https://github.com/CVHub520/X-AnyLabeling/releases/download/v0.1.0/yolov8n.onnx"
         
     - name: Copy OpenCV DLL
       run: |
