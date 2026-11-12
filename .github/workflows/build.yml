@@ -7,28 +7,24 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    - name: Setup MSVC
-      uses: ilammy/msvc-dev-cmd@v1
-      
-    - name: Setup vcpkg (OpenCV)
+    - name: Download and Extract OpenCV (Fast)
       run: |
-        git clone https://github.com/microsoft/vcpkg
-        .\vcpkg\bootstrap-vcpkg.bat
-        .\vcpkg\vcpkg install opencv[core]:x64-windows
+        Invoke-WebRequest -Uri "https://github.com/opencv/opencv/releases/download/4.8.0/opencv-4.8.0-windows.exe" -OutFile "opencv.exe"
+        Start-Process -FilePath ".\opencv.exe" -ArgumentList "-o`"C:\OpenCV`" -y" -Wait
         
     - name: Configure CMake
-      run: cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake"
+      run: cmake -B build -S . -DOpenCV_DIR="C:/OpenCV/opencv/build"
       
-    - name: Build
+    - name: Build App
       run: cmake --build build --config Release
       
     - name: Download AI Model
       run: |
-        Invoke-WebRequest -Uri "https://huggingface.co/Ultralytics/YOLOv8/resolve/main/yolov8n.onnx" -OutFile "build/Release/yolov8n.onnx"
+        curl.exe -L -o build/Release/yolov8n.onnx "https://huggingface.co/Ultralytics/YOLOv8/resolve/main/yolov8n.onnx"
         
-    - name: Copy OpenCV DLLs
+    - name: Copy OpenCV DLL
       run: |
-        copy .\vcpkg\installed\x64-windows\bin\*.dll build\Release\
+        copy C:\OpenCV\opencv\build\x64\vc16\bin\opencv_world480.dll build\Release\
         
     - name: Upload Final Package
       uses: actions/upload-artifact@v4
