@@ -14,7 +14,7 @@
 #pragma comment(lib, "dxgi.lib")
 
 // ================= الإعدادات =================
-const int FOV = 320;                   // نطاق البحث
+const int FOV = 320;                   // نطاق البحث (320 * 2 = 640 وهو حجم النموذج)
 const int TRIGGER_KEY = VK_MENU;       // زر ALT للتفعيل
 const float ASSIST_RADIUS = 150.0f;    // نطاق المساعدة (لا يسحب إلا إذا كنت قريباً من العدو)
 const float PREDICT_TIME = 0.04f;      // التنبؤ بالحركة (40ms)
@@ -97,7 +97,6 @@ int main() {
     std::cout << "[+] Loading AI Model (YOLOv8)...\n";
     cv::dnn::Net net = cv::dnn::readNetFromONNX("yolov8n.onnx");
     net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-    // تفعيل كرت الشاشة المدمج (Intel) لتسريع المعالجة على i3
     net.setPreferableTarget(cv::dnn::DNN_TARGET_OPENCL);
 
     DXGICapture capture;
@@ -119,7 +118,9 @@ int main() {
         if (!capture.GetFrame(frame)) continue;
 
         cv::Mat rgbFrame; cv::cvtColor(frame, rgbFrame, cv::COLOR_BGRA2RGB);
-        cv::Mat blob; cv::dnn::blobFromImage(rgbFrame, blob, 1.0 / 255.0, cv::Size(320, 320), cv::Scalar(), true, false);
+        
+        // الإصلاح هنا: تغيير 320x320 إلى 640x640 ليتوافق مع النموذج
+        cv::Mat blob; cv::dnn::blobFromImage(rgbFrame, blob, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true, false);
         net.setInput(blob);
         std::vector<cv::Mat> outputs; net.forward(outputs, net.getUnconnectedOutLayersNames());
 
