@@ -14,10 +14,10 @@
 #pragma comment(lib, "dxgi.lib")
 
 // ================= الإعدادات =================
-const int FOV = 320;                   // نطاق البحث (320 * 2 = 640 وهو حجم النموذج)
+const int FOV = 320;                   // نطاق البحث (سيتم التقاط 640x640 بكسل من المركز)
 const int TRIGGER_KEY = VK_MENU;       // زر ALT للتفعيل
-const float ASSIST_RADIUS = 150.0f;    // نطاق المساعدة (لا يسحب إلا إذا كنت قريباً من العدو)
-const float PREDICT_TIME = 0.04f;      // التنبؤ بالحركة (40ms)
+const float ASSIST_RADIUS = 300.0f;    // نطاق المساعدة (البكسل)
+const float PREDICT_TIME = 0.04f;      // التنبؤ بالحركة
 // ============================================
 
 class DXGICapture {
@@ -62,7 +62,6 @@ public:
     }
 };
 
-// حركة بشرية (Bezier + Overshoot + Tremor)
 void HumanizedMove(int targetX, int targetY) {
     POINT currentPos; GetCursorPos(&currentPos);
     float distance = std::hypot(targetX - currentPos.x, targetY - currentPos.y);
@@ -97,65 +96,75 @@ int main() {
     std::cout << "[+] Loading AI Model (YOLOv8)...\n";
     cv::dnn::Net net = cv::dnn::readNetFromONNX("yolov8n.onnx");
     net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-    net.setPreferableTarget(cv::dnn::DNN_TARGET_OPENCL);
+    net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU); // معالج لضمان الاستقرار
 
     DXGICapture capture;
-    if (!capture.Init()) { std::cout << "[-] DXGI Failed. Run Windowed Mode.\n"; return 1; }
+    if (!capture.Init()) { std::cout << "[-] DXGI Failed. Make sure BlueStacks is Windowed.\n"; return 1; }
 
     cv::Mat frame;
     float lastTargetX = -1, lastTargetY = -1;
     auto lastTime = std::chrono::high_resolution_clock::now();
+    int noTargetCounter = 0;
 
-    std::cout << "[+] Aimbot Running. Hold [ALT] to aim.\n";
+    std::cout << "[+] Aimbot Running. Hold [ALT] to aim.\n\n";
 
     while (true) {
-        if (!(GetAsyncKeyState(TRIGGER_KEY) & 0x8000)) { 
-            lastTargetX = -1; 
-            std::this_thread::sleep_for(std::chrono::milliseconds(10)); 
-            continue; 
-        }
-        
         if (!capture.GetFrame(frame)) continue;
 
         cv::Mat rgbFrame; cv::cvtColor(frame, rgbFrame, cv::COLOR_BGRA2RGB);
-        
-        // الإصلاح هنا: تغيير 320x320 إلى 640x640 ليتوافق مع النموذج
         cv::Mat blob; cv::dnn::blobFromImage(rgbFrame, blob, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true, false);
         net.setInput(blob);
         std::vector<cv::Mat> outputs; net.forward(outputs, net.getUnconnectedOutLayersNames());
 
         float* data = (float*)outputs[0].data;
-        int dimensions = outputs[0].size[1]; // 84
-        int rows = outputs[0].size[2];       // 8400
+        int dimensions = outputs[0].size[1]; 
+        int rows = outputs[0].size[2];       
         float minDist = FLT_MAX; cv::Point bestTarget(-1, -1);
+        float bestConf = 0.0f;
 
         for (int i = 0; i < rows; ++i) {
             float* rowData = data + i * dimensions;
-            float confidence = rowData[4]; // نسبة التأكد من أنه شخص
-            if (confidence > 0.45) { 
+            float confidence = rowData[4]; 
+            
+            // نسبة الثقة 25% لاكتشاف اللاعبين
+            if (confidence > 0.25) { 
                 int cx = (int)(rowData[0] * frame.cols);
                 int cy = (int)(rowData[1] * frame.rows);
                 int w = (int)(rowData[2] * frame.cols);
                 int h = (int)(rowData[3] * frame.rows);
-                int topY = cy - h / 2; // أعلى نقطة في المربع (الرأس)
+                int topY = cy - h / 2; 
                 
                 float dist = std::hypot(cx - (frame.cols / 2), topY - (frame.rows / 2));
-                // نطاق المساعدة (Assist Radius): يتجاهل الأعداء البعيدين جداً
+                
+                // إذا كان الهدف داخل نطاق المساعدة، اختره
                 if (dist < minDist && dist < ASSIST_RADIUS) { 
                     minDist = dist; 
                     bestTarget = cv::Point(cx, topY); 
+                    bestConf = confidence;
                 }
             }
         }
 
+        // === ميزة التشخيص (الطباعة في الشاشة السوداء) ===
         if (bestTarget.x != -1) {
+            std::cout << "[+] Target Found! Confidence: " << bestConf << " | Distance: " << minDist << std::endl;
+            noTargetCounter = 0;
+        } else {
+            noTargetCounter++;
+            if (noTargetCounter > 100) { // لتجنب إغراق الشاشة
+                std::cout << "[-] Scanning... No targets in range.\n";
+                noTargetCounter = 0;
+            }
+        }
+
+        // التحرك والإطلاق (فقط عند الضغط على ALT)
+        if ((GetAsyncKeyState(TRIGGER_KEY) & 0x8000) && bestTarget.x != -1) {
             auto currentTime = std::chrono::high_resolution_clock::now();
             float deltaTime = std::chrono::duration<float>(currentTime - lastTime).count();
             
             float aimX = bestTarget.x;
             float aimY = bestTarget.y;
 
-            // التنبؤ بالحركة (Predictive Tracking)
             if (lastTargetX != -1 && deltaTime > 0.01f && deltaTime < 0.1f) {
                 float velX = (bestTarget.x - lastTargetX) / deltaTime;
                 float velY = (bestTarget.y - lastTargetY) / deltaTime;
@@ -170,8 +179,7 @@ int main() {
 
             HumanizedMove(actualX, actualY);
 
-            // الإطلاق التلقائي (Triggerbot) مع وقت رد فعل بشري
-            if (minDist < 15.0f) { 
+            if (minDist < 25.0f) { // إذا كان التصويب قريباً جداً من الهدف
                 int reactionDelay = 20 + (rand() % 30);
                 std::this_thread::sleep_for(std::chrono::milliseconds(reactionDelay));
                 
@@ -181,6 +189,8 @@ int main() {
                 click.mi.dwFlags = MOUSEEVENTF_LEFTUP; SendInput(1, &click, sizeof(INPUT));
                 std::this_thread::sleep_for(std::chrono::milliseconds(60)); 
             }
+        } else {
+            lastTargetX = -1;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
