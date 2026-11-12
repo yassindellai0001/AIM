@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.10)
+project(PC_Aimbot)
+find_package(OpenCV REQUIRED)
+add_executable(PC_Aimbot main.cpp)
+target_link_libraries(PC_Aimbot ${OpenCV_LIBS} d3d11 dxgi)
