@@ -1,0 +1,37 @@
+name: Build PC Aimbot
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+      
+    - name: Setup vcpkg (OpenCV)
+      run: |
+        git clone https://github.com/microsoft/vcpkg
+        .\vcpkg\bootstrap-vcpkg.bat
+        .\vcpkg\vcpkg install opencv[core]:x64-windows
+        
+    - name: Configure CMake
+      run: cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake"
+      
+    - name: Build
+      run: cmake --build build --config Release
+      
+    - name: Download AI Model
+      run: |
+        Invoke-WebRequest -Uri "https://huggingface.co/Ultralytics/YOLOv8/resolve/main/yolov8n.onnx" -OutFile "build/Release/yolov8n.onnx"
+        
+    - name: Copy OpenCV DLLs
+      run: |
+        copy .\vcpkg\installed\x64-windows\bin\*.dll build\Release\
+        
+    - name: Upload Final Package
+      uses: actions/upload-artifact@v4
+      with:
+        name: PC-Aimbot-Final
+        path: build/Release/
