@@ -10,7 +10,6 @@
 #include <cmath>
 #include <vector>
 #include <atomic>
-#include <mutex>
 #include <algorithm>
 
 #pragma comment(lib, "d3d11.lib")
@@ -20,24 +19,27 @@
 using Microsoft::WRL::ComPtr;
 
 // =====================================================================
-// Thread-Safe Global Variables & App State
+// Global Thread-Safe Variables
 // =====================================================================
 std::atomic<bool> g_appRunning(true);
 std::atomic<int> g_circleRadius(120);
 std::atomic<bool> g_isFiring(false);
 std::atomic<bool> g_isAltPressed(false);
-std::atomic<HWND> g_overlayHwnd(nullptr);
 std::atomic<bool> g_needsRedraw(false);
+
+std::atomic<int> g_overlayState(0); // 0=Init, 1=Success, -1=Failed
+std::atomic<DWORD> g_overlayThreadId(0);
+std::atomic<HWND> g_overlayHwnd(nullptr);
 const int TRIGGER_KEY = VK_MENU; // ALT
 
 std::vector<std::pair<cv::Mat, double>> g_templateBank;
 auto lastRecoilTime = std::chrono::high_resolution_clock::now();
 // =====================================================================
 
-enum class CaptureStatus { Success, Timeout, AccessLost, Error };
+enum class CaptureStatus { Success, Timeout, AccessLost, Error, InvalidROI };
 
 // =====================================================================
-// RAII Wrapper for DXGI Frame
+// RAII Wrappers (Strict Resource Safety)
 // =====================================================================
 class DXGIFrameLocker {
 private:
@@ -45,6 +47,15 @@ private:
 public:
     DXGIFrameLocker(IDXGIOutputDuplication* dup) : duplication(dup) {}
     ~DXGIFrameLocker() { if (duplication) duplication->ReleaseFrame(); }
+};
+
+class DXGIMapLocker {
+private:
+    ID3D11DeviceContext* context;
+    ID3D11Resource* resource;
+public:
+    DXGIMapLocker(ID3D11DeviceContext* ctx, ID3D11Resource* res) : context(ctx), resource(res) {}
+    ~DXGIMapLocker() { if (context && resource) context->Unmap(resource, 0); }
 };
 
 // =====================================================================
@@ -57,10 +68,16 @@ private:
     ComPtr<IDXGIOutputDuplication> deskDupl;
     ComPtr<ID3D11Texture2D> stagingTex;
     
-    int texWidth = 0; int texHeight = 0;
+    int texWidth = 0; 
+    int texHeight = 0;
+    DXGI_FORMAT texFormat = DXGI_FORMAT_UNKNOWN; 
+    
     bool isInitialized = false;
+    bool isRGBA = false;
 
 public:
+    bool IsInitialized() const { return isInitialized; }
+
     bool Init() {
         Cleanup(); 
         D3D_FEATURE_LEVEL featureLevel;
@@ -76,6 +93,8 @@ public:
         if (SUCCEEDED(hr)) { isInitialized = true; return true; }
         return false;
     }
+
+    bool IsRGBA() const { return isRGBA; }
 
     CaptureStatus GrabFrame(cv::Mat& outFrame, int currentRadius) {
         if (!isInitialized || !deskDupl) return CaptureStatus::Error;
@@ -98,38 +117,54 @@ public:
         D3D11_TEXTURE2D_DESC desc;
         acquiredImage->GetDesc(&desc);
 
-        if (!stagingTex || texWidth != (int)desc.Width || texHeight != (int)desc.Height) {
+        if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM) isRGBA = true;
+        else if (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM) isRGBA = false;
+        else return CaptureStatus::Error;
+
+        if (!stagingTex || texWidth != (int)desc.Width || texHeight != (int)desc.Height || texFormat != desc.Format) {
             stagingTex.Reset();
             desc.Usage = D3D11_USAGE_STAGING; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ; desc.BindFlags = 0; desc.MiscFlags = 0;
             hr = device->CreateTexture2D(&desc, nullptr, stagingTex.GetAddressOf());
             if (FAILED(hr)) return CaptureStatus::Error;
-            texWidth = desc.Width; texHeight = desc.Height;
+            texWidth = desc.Width; texHeight = desc.Height; texFormat = desc.Format;
         }
 
         context->CopyResource(stagingTex.Get(), acquiredImage.Get());
 
         D3D11_MAPPED_SUBRESOURCE mapped = { 0 };
         hr = context->Map(stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-        if (FAILED(hr)) return CaptureStatus::Error;
+        
+        // === الإصلاح الجذري: التحقق من FAILED أولاً ===
+        if (FAILED(hr)) {
+            return CaptureStatus::Error; 
+        }
+
+        // بما أن hr نجح، يجب علينا الآن ضمان استدعاء Unmap في كل الحالات
+        DXGIMapLocker mapLocker(context.Get(), stagingTex.Get());
+
+        // الآن يمكننا فحص المؤشر بأمان (إذا كان فارغاً، الـ RAII سيتكفل بالتنظيف)
+        if (mapped.pData == nullptr) {
+            return CaptureStatus::Error;
+        }
 
         int centerX = desc.Width / 2; int centerY = desc.Height / 2;
         int fov = currentRadius + 20;
         cv::Rect roi(centerX - fov, centerY - fov, fov * 2, fov * 2);
         
-        if (roi.x >= 0 && roi.y >= 0 && roi.x + roi.width <= (int)desc.Width && roi.y + roi.height <= (int)desc.Height) {
-            // الإصلاح هنا: RowPitch بدلاً من pRowPitch
-            cv::Mat fullFrame(desc.Height, desc.Width, CV_8UC4, mapped.pData, mapped.RowPitch);
-            outFrame = fullFrame(roi).clone();
+        if (roi.x < 0 || roi.y < 0 || roi.x + roi.width > (int)desc.Width || roi.y + roi.height > (int)desc.Height) {
+            return CaptureStatus::InvalidROI;
         }
 
-        context->Unmap(stagingTex.Get(), 0);
+        cv::Mat fullFrame(desc.Height, desc.Width, CV_8UC4, mapped.pData, mapped.RowPitch);
+        outFrame = fullFrame(roi).clone();
+
         return CaptureStatus::Success;
     }
 
     void Cleanup() {
         isInitialized = false;
         stagingTex.Reset(); deskDupl.Reset(); context.Reset(); device.Reset();
-        texWidth = 0; texHeight = 0;
+        texWidth = 0; texHeight = 0; texFormat = DXGI_FORMAT_UNKNOWN;
     }
 };
 
@@ -162,19 +197,15 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
         RECT rect; GetClientRect(hwnd, &rect);
         HBRUSH bgBrush = CreateSolidBrush(RGB(0, 0, 0)); FillRect(hdc, &rect, bgBrush); DeleteObject(bgBrush);
-
         int cx = GetSystemMetrics(SM_CXSCREEN) / 2; int cy = GetSystemMetrics(SM_CYSCREEN) / 2;
         int radius = g_circleRadius.load();
-
         HPEN hGreenPen = CreatePen(PS_SOLID, 2, RGB(0, 255, 0));
         HGDIOBJ oldPen = SelectObject(hdc, hGreenPen);
         HBRUSH hNullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
         HGDIOBJ oldBrush = SelectObject(hdc, hNullBrush);
-
         Ellipse(hdc, cx - radius, cy - radius, cx + radius, cy + radius);
         MoveToEx(hdc, cx - 5, cy, NULL); LineTo(hdc, cx + 5, cy);
         MoveToEx(hdc, cx, cy - 5, NULL); LineTo(hdc, cx, cy + 5);
-
         SelectObject(hdc, oldPen); SelectObject(hdc, oldBrush); DeleteObject(hGreenPen);
         EndPaint(hwnd, &ps); return 0;
     }
@@ -183,31 +214,53 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 }
 
 void OverlayThread() {
-    WNDCLASS wc = { 0 }; wc.lpfnWndProc = OverlayProc; wc.hInstance = GetModuleHandle(NULL);
-    wc.lpszClassName = "AimbotOverlay"; RegisterClass(&wc);
+    g_overlayThreadId.store(GetCurrentThreadId());
+
+    WNDCLASS wc = { 0 }; 
+    wc.lpfnWndProc = OverlayProc; 
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = "AimbotOverlay"; 
+    
+    if (!RegisterClass(&wc)) {
+        g_overlayState.store(-1);
+        return;
+    }
 
     HWND hwnd = CreateWindowEx(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         "AimbotOverlay", "Overlay", WS_POPUP, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), NULL, NULL, wc.hInstance, NULL);
 
-    if (hwnd) {
-        g_overlayHwnd.store(hwnd);
-        SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
-        ShowWindow(hwnd, SW_SHOW);
-
-        MSG msg;
-        while (GetMessage(&msg, NULL, 0, 0) > 0) {
-            TranslateMessage(&msg); DispatchMessage(&msg);
-        }
-        DestroyWindow(hwnd);
+    if (!hwnd) {
+        UnregisterClass("AimbotOverlay", wc.hInstance);
+        g_overlayState.store(-1);
+        return;
     }
+
+    g_overlayHwnd.store(hwnd);
+    SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
+    ShowWindow(hwnd, SW_SHOW);
+    
+    g_overlayState.store(1);
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg); DispatchMessage(&msg);
+    }
+    
+    if (IsWindow(hwnd)) DestroyWindow(hwnd);
     UnregisterClass("AimbotOverlay", wc.hInstance);
 }
 
 BOOL WINAPI ConsoleHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT) {
         g_appRunning.store(false);
+        
         HWND hwnd = g_overlayHwnd.load();
-        if (hwnd) PostMessage(hwnd, WM_CLOSE, 0, 0);
+        if (hwnd && PostMessage(hwnd, WM_CLOSE, 0, 0)) {
+            // WM_CLOSE سيؤدي إلى WM_DESTROY ثم WM_QUIT
+        } else {
+            DWORD threadId = g_overlayThreadId.load();
+            if (threadId != 0) PostThreadMessage(threadId, WM_QUIT, 0, 0);
+        }
         return TRUE;
     }
     return FALSE;
@@ -217,12 +270,12 @@ BOOL WINAPI ConsoleHandler(DWORD signal) {
 // Main Function
 // =====================================================================
 int main() {
-    std::cout << "[+] Starting Optimized Aimbot (V28.1)...\n";
+    std::cout << "[+] Starting Ultimate Aimbot (V36.0)...\n";
     SetConsoleCtrlHandler(ConsoleHandler, TRUE);
     
     cv::Mat rawTemplate = cv::imread("enemy_template.png", cv::IMREAD_GRAYSCALE);
     if (rawTemplate.empty()) {
-        std::cout << "[-] ERROR: Please place 'enemy_template.png' in the same folder!\n";
+        std::cerr << "[-] ERROR: Please place 'enemy_template.png' in the same folder!\n";
         return 1;
     }
 
@@ -235,13 +288,43 @@ int main() {
         cv::Canny(resized, resized, 50, 150);
         g_templateBank.push_back({ resized, scale });
     }
-    std::cout << "[+] Template Bank prepared with " << g_templateBank.size() << " scales.\n";
+    std::cout << "[+] Template Bank ready (" << g_templateBank.size() << " scales).\n";
 
     std::thread overlayTh(OverlayThread);
-    DXGICaptureEngine capture;
     
-    while (g_appRunning.load() && !capture.Init()) {
+    while (g_overlayState.load() == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    if (g_overlayState.load() == -1) {
+        std::cerr << "[-] FATAL: Failed to create Overlay window. Exiting.\n";
+        if (overlayTh.joinable()) overlayTh.join();
+        return 1;
+    }
+    std::cout << "[+] Overlay Initialized.\n";
+
+    DXGICaptureEngine capture;
+    int retryCount = 0;
+    while (g_appRunning.load() && !capture.Init() && retryCount < 5) {
+        std::cout << "[-] DXGI Init Failed. Retrying in 2s (" << (retryCount + 1) << "/5)...\n";
         std::this_thread::sleep_for(std::chrono::seconds(2));
+        retryCount++;
+    }
+
+    if (!capture.IsInitialized()) {
+        std::cerr << "[-] FATAL: Failed to initialize DXGI after 5 attempts. Exiting.\n";
+        g_appRunning.store(false);
+        
+        HWND hwnd = g_overlayHwnd.load();
+        if (hwnd && PostMessage(hwnd, WM_CLOSE, 0, 0)) {
+            // Good
+        } else {
+            DWORD threadId = g_overlayThreadId.load();
+            if (threadId != 0) PostThreadMessage(threadId, WM_QUIT, 0, 0);
+        }
+        
+        if (overlayTh.joinable()) overlayTh.join();
+        return 1;
     }
 
     std::cout << "[+] Engine Initialized. Hold [ALT] to aim.\n";
@@ -250,6 +333,9 @@ int main() {
     cv::Mat roiFrame, bgrFrame, grayFrame, hsvFrame, circleMask, searchEdges;
     std::vector<std::vector<cv::Point>> redContours;
     int lastMaskRadius = -1;
+    
+    auto lastPrintTime = std::chrono::high_resolution_clock::now();
+    bool printedRedAnchor = false;
 
     while (g_appRunning.load()) {
         auto now = std::chrono::high_resolution_clock::now();
@@ -260,7 +346,6 @@ int main() {
             if (!altState) SetFireState(false);
 
             int currentRadius = g_circleRadius.load();
-            
             if (GetAsyncKeyState(VK_ADD) & 0x8000 || GetAsyncKeyState(VK_OEM_PLUS) & 0x8000) { g_circleRadius.store(std::min(currentRadius + 3, 500)); g_needsRedraw.store(true); }
             if (GetAsyncKeyState(VK_SUBTRACT) & 0x8000 || GetAsyncKeyState(VK_OEM_MINUS) & 0x8000) { g_circleRadius.store(std::max(currentRadius - 3, 30)); g_needsRedraw.store(true); }
             
@@ -272,22 +357,30 @@ int main() {
         }
 
         int currentRadius = g_circleRadius.load();
-
         CaptureStatus status = capture.GrabFrame(roiFrame, currentRadius);
         
         if (status == CaptureStatus::AccessLost) {
-            std::cout << "[!] Access Lost. Re-initializing DXGI...\n";
             capture.Cleanup(); 
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            while (g_appRunning.load() && !capture.Init()) { std::this_thread::sleep_for(std::chrono::seconds(1)); }
+            int reinitRetries = 0;
+            while (g_appRunning.load() && !capture.Init() && reinitRetries < 5) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                reinitRetries++;
+            }
+            if (!capture.IsInitialized()) {
+                std::cerr << "[-] FATAL: Lost DXGI access and failed to recover. Exiting.\n";
+                g_appRunning.store(false);
+            }
             continue;
-        } else if (status != CaptureStatus::Success) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
+        } else if (status != CaptureStatus::Success) { 
+            std::this_thread::sleep_for(std::chrono::milliseconds(1)); 
+            continue; 
         }
 
         if (!roiFrame.empty()) {
-            cv::cvtColor(roiFrame, bgrFrame, cv::COLOR_BGRA2BGR);
+            if (capture.IsRGBA()) cv::cvtColor(roiFrame, bgrFrame, cv::COLOR_RGBA2BGR);
+            else cv::cvtColor(roiFrame, bgrFrame, cv::COLOR_BGRA2BGR);
+
             cv::cvtColor(bgrFrame, grayFrame, cv::COLOR_BGR2GRAY);
             cv::cvtColor(bgrFrame, hsvFrame, cv::COLOR_BGR2HSV);
             cv::GaussianBlur(grayFrame, grayFrame, cv::Size(3, 3), 0);
@@ -323,6 +416,12 @@ int main() {
             }
 
             if (anchorPoint.x != -1 && g_isAltPressed.load()) {
+                if (std::chrono::duration<float, std::milli>(now - lastPrintTime).count() > 1000.0f) {
+                    std::cout << "[DEBUG] Red Anchor Found. Searching shape...\n";
+                    lastPrintTime = now;
+                    printedRedAnchor = true;
+                }
+
                 int searchSize = currentRadius * 2;
                 int sx = std::max(0, anchorPoint.x - searchSize / 2);
                 int sy = std::max(0, anchorPoint.y - searchSize / 2);
@@ -331,6 +430,7 @@ int main() {
 
                 bool foundHead = false;
                 int highestY = anchorPoint.y;
+                double bestMatchValue = 0.0;
 
                 if (sw > 0 && sh > 0) {
                     cv::Mat searchArea = grayFrame(cv::Rect(sx, sy, sw, sh));
@@ -347,11 +447,11 @@ int main() {
                         cv::Point minLoc, maxLoc;
                         cv::minMaxLoc(resultMat, &minVal, &maxVal, &minLoc, &maxLoc);
 
+                        if (maxVal > bestMatchValue) bestMatchValue = maxVal;
+
                         if (maxVal > 0.65) {
                             int matchCenterX = sx + maxLoc.x + (resizedTemplate.cols / 2);
                             int matchCenterY = sy + maxLoc.y + (resizedTemplate.rows / 2);
-                            
-                            // إصلاح التحذير: تغيير float إلى double
                             double dist = std::hypot(matchCenterX - cx, matchCenterY - cy);
 
                             if (dist <= currentRadius) {
@@ -361,6 +461,12 @@ int main() {
                             }
                         }
                     }
+                }
+
+                if (std::chrono::duration<float, std::milli>(now - lastPrintTime).count() > 1000.0f || (!foundHead && printedRedAnchor)) {
+                    std::cout << "[DEBUG] Match Value: " << bestMatchValue << " | " << (foundHead ? "TARGET ACQUIRED!" : "Not recognized (0.65 required).") << "\n";
+                    lastPrintTime = now;
+                    printedRedAnchor = false;
                 }
 
                 if (foundHead) {
@@ -379,7 +485,13 @@ int main() {
                         }
                     }
                 } else { SetFireState(false); }
-            } else { SetFireState(false); }
+            } else {
+                if (g_isAltPressed.load() && std::chrono::duration<float, std::milli>(now - lastPrintTime).count() > 1000.0f) {
+                    std::cout << "[DEBUG] No RED anchor found inside circle.\n";
+                    lastPrintTime = now;
+                }
+                SetFireState(false); 
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -388,7 +500,12 @@ int main() {
     g_appRunning.store(false);
     
     HWND hwnd = g_overlayHwnd.load();
-    if (hwnd) PostMessage(hwnd, WM_CLOSE, 0, 0);
+    if (hwnd && PostMessage(hwnd, WM_CLOSE, 0, 0)) {
+        // Good
+    } else {
+        DWORD threadId = g_overlayThreadId.load();
+        if (threadId != 0) PostThreadMessage(threadId, WM_QUIT, 0, 0);
+    }
     
     if (overlayTh.joinable()) overlayTh.join();
     
