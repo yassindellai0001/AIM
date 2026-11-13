@@ -19,11 +19,11 @@
 using Microsoft::WRL::ComPtr;
 
 // =====================================================================
-// Global Thread-Safe Variables & Tunable Settings
+// Global Variables & Settings
 // =====================================================================
 std::atomic<bool> g_appRunning(true);
 std::atomic<int> g_circleRadius(120);
-std::atomic<bool> g_isFiring(false); // حالة زر الإطلاق
+std::atomic<bool> g_isFiring(false); 
 std::atomic<bool> g_isAltPressed(false);
 std::atomic<bool> g_needsRedraw(false);
 std::atomic<int> g_overlayState(0); 
@@ -31,11 +31,12 @@ std::atomic<DWORD> g_overlayThreadId(0);
 std::atomic<HWND> g_overlayHwnd(nullptr);
 const int TRIGGER_KEY = VK_MENU; // ALT
 
-std::vector<std::pair<cv::Mat, double>> g_templateBank;
-auto lastRecoilTime = std::chrono::high_resolution_clock::now();
+cv::Mat g_refTemplate; // الصورة المرجعية (بدون تشويه)
 
-// إعدادات قابلة للتعديل أثناء اللعب
-std::atomic<double> g_matchThreshold(0.45); 
+auto lastRecoilTime = std::chrono::high_resolution_clock::now();
+auto lastTimeTargetSeen = std::chrono::high_resolution_clock::now(); 
+
+std::atomic<double> g_matchThreshold(0.35); 
 std::atomic<int> g_headOffset(0);           
 // =====================================================================
 
@@ -64,7 +65,6 @@ private:
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<IDXGIOutputDuplication> deskDupl;
     ComPtr<ID3D11Texture2D> stagingTex;
-    
     int texWidth = 0; int texHeight = 0;
     DXGI_FORMAT texFormat = DXGI_FORMAT_UNKNOWN; 
     bool isInitialized = false;
@@ -97,7 +97,8 @@ public:
 
         DXGI_OUTDUPL_FRAME_INFO frameInfo = { 0 };
         ComPtr<IDXGIResource> desktopResource;
-        HRESULT hr = deskDupl->AcquireNextFrame(0, &frameInfo, desktopResource.GetAddressOf());
+        
+        HRESULT hr = deskDupl->AcquireNextFrame(10, &frameInfo, desktopResource.GetAddressOf());
         
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) return CaptureStatus::Timeout;
         if (hr == DXGI_ERROR_ACCESS_LOST) return CaptureStatus::AccessLost;
@@ -153,15 +154,15 @@ public:
     }
 };
 
-// حركة ماوس ناعمة (للتخفي)
-void SmoothSnapToTarget(int deltaY) {
-    if (std::abs(deltaY) < 2) return;
+void SmoothSnapToTarget(int deltaX, int deltaY) {
+    if (std::abs(deltaX) < 2 && std::abs(deltaY) < 2) return;
     int steps = 3; 
+    int stepX = deltaX / steps;
     int stepY = deltaY / steps;
     
     for (int i = 0; i < steps; i++) {
-        INPUT input = { 0 }; 
-        input.type = INPUT_MOUSE;
+        INPUT input = { 0 }; input.type = INPUT_MOUSE;
+        input.mi.dx = (i == steps - 1) ? (deltaX - stepX * (steps - 1)) : stepX; 
         input.mi.dy = (i == steps - 1) ? (deltaY - stepY * (steps - 1)) : stepY; 
         input.mi.dwFlags = MOUSEEVENTF_MOVE;
         SendInput(1, &input, sizeof(INPUT));
@@ -169,7 +170,6 @@ void SmoothSnapToTarget(int deltaY) {
     }
 }
 
-// إطلاق النار (Hold)
 void SetFireState(bool fire) {
     if (fire && !g_isFiring.load()) {
         INPUT click = { 0 }; click.type = INPUT_MOUSE; click.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
@@ -193,8 +193,6 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         HBRUSH hNullBrush = (HBRUSH)GetStockObject(NULL_BRUSH);
         HGDIOBJ oldBrush = SelectObject(hdc, hNullBrush);
         Ellipse(hdc, cx - radius, cy - radius, cx + radius, cy + radius);
-        MoveToEx(hdc, cx - 5, cy, NULL); LineTo(hdc, cx + 5, cy);
-        MoveToEx(hdc, cx, cy - 5, NULL); LineTo(hdc, cx, cy + 5);
         SelectObject(hdc, oldPen); SelectObject(hdc, oldBrush); DeleteObject(hGreenPen);
         EndPaint(hwnd, &ps); return 0;
     }
@@ -234,47 +232,33 @@ BOOL WINAPI ConsoleHandler(DWORD signal) {
 }
 
 int main() {
-    std::cout << "[+] Starting Full Auto-Aim & Fire (V42.0)...\n";
-    std::cout << "[CONTROLS] +/- : Circle Size\n";
-    std::cout << "[CONTROLS] LEFT/RIGHT Arrows : Match Threshold\n";
-    std::cout << "[CONTROLS] UP/DOWN Arrows : Head Offset\n";
-    std::cout << "[INFO] Hold [ALT] to Aim and Fire.\n";
-
+    std::cout << "[+] Starting True Multi-Scale Aimbot (V60.0)...\n";
     SetConsoleCtrlHandler(ConsoleHandler, TRUE);
     
     cv::Mat rawTemplate = cv::imread("enemy_template.png", cv::IMREAD_GRAYSCALE);
     if (rawTemplate.empty()) {
-        std::cerr << "[-] ERROR: Please place 'enemy_template.png' in the same folder!\n";
+        std::cerr << "[-] FATAL ERROR: Could not load 'enemy_template.png'.\n";
         return 1;
     }
-
-    cv::threshold(rawTemplate, rawTemplate, 240, 255, cv::THRESH_TOZERO_INV);
-    int cropHeight = (int)(rawTemplate.rows * 0.70);
-    if (cropHeight > 10) rawTemplate = rawTemplate(cv::Rect(0, 0, rawTemplate.cols, cropHeight)).clone();
     
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2)); 
-    for (double scale = 0.3; scale <= 1.8; scale += 0.1) {
-        cv::Mat resized, blurred, edges;
-        cv::resize(rawTemplate, resized, cv::Size(), scale, scale);
-        cv::GaussianBlur(resized, blurred, cv::Size(3, 3), 0);
-        cv::Canny(blurred, edges, 50, 150);
-        cv::dilate(edges, edges, kernel);
-        g_templateBank.push_back({ edges, scale });
-    }
-    std::cout << "[+] Template Bank ready.\n";
+    cv::GaussianBlur(rawTemplate, g_refTemplate, cv::Size(5, 5), 0);
+    cv::Canny(g_refTemplate, g_refTemplate, 50, 150);
+    cv::dilate(g_refTemplate, g_refTemplate, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
 
     std::thread overlayTh(OverlayThread);
     while (g_overlayState.load() == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
-    if (g_overlayState.load() == -1) { std::cerr << "[-] FATAL: Overlay failed.\n"; if (overlayTh.joinable()) overlayTh.join(); return 1; }
+    if (g_overlayState.load() == -1) { std::cerr << "[-] FATAL ERROR: Overlay Failed.\n"; if (overlayTh.joinable()) overlayTh.join(); return 1; }
 
     DXGICaptureEngine capture;
     while (g_appRunning.load() && !capture.Init()) { std::this_thread::sleep_for(std::chrono::seconds(2)); }
     if (!capture.IsInitialized()) { g_appRunning.store(false); if (overlayTh.joinable()) overlayTh.join(); return 1; }
 
-    std::cout << "[+] Engine Initialized. Hold [ALT] to aim & fire.\n";
-    auto lastInputCheck = std::chrono::high_resolution_clock::now();
+    std::cout << "[+] Engine Initialized Successfully. Hold [ALT] to aim.\n";
     
-    cv::Mat roiFrame, bgrFrame, grayFrame, hsvFrame, circleMask, blurredSearch, searchEdges;
+    auto lastInputCheck = std::chrono::high_resolution_clock::now();
+    auto lastRadiusChange = std::chrono::high_resolution_clock::now(); 
+    
+    cv::Mat roiFrame, bgrFrame, grayFrame, hsvFrame, circleMask, searchEdges;
     std::vector<std::vector<cv::Point>> redContours;
     int lastMaskRadius = -1;
     auto lastPrintTime = std::chrono::high_resolution_clock::now();
@@ -282,25 +266,29 @@ int main() {
     while (g_appRunning.load()) {
         auto now = std::chrono::high_resolution_clock::now();
         
-        // 1. التحقق من المدخلات
         if (std::chrono::duration<float, std::milli>(now - lastInputCheck).count() > 20.0f) {
             bool altState = (GetAsyncKeyState(TRIGGER_KEY) & 0x8000) != 0;
             g_isAltPressed.store(altState);
             
-            // إذا تم رفع الإصبع عن ALT، نوقف الإطلاق فوراً
-            if (!altState) {
-                SetFireState(false);
-            }
+            if (!altState) SetFireState(false);
 
             int currentRadius = g_circleRadius.load();
-            if (GetAsyncKeyState(VK_ADD) & 0x8000) { g_circleRadius.store(std::min(currentRadius + 3, 500)); g_needsRedraw.store(true); }
-            if (GetAsyncKeyState(VK_SUBTRACT) & 0x8000) { g_circleRadius.store(std::max(currentRadius - 3, 30)); g_needsRedraw.store(true); }
+            if (GetAsyncKeyState(VK_ADD) & 0x8000 || GetAsyncKeyState(VK_OEM_PLUS) & 0x8000) { 
+                if (std::chrono::duration<float, std::milli>(now - lastRadiusChange).count() > 50.0f) {
+                    g_circleRadius.store(std::min(currentRadius + 3, 500)); g_needsRedraw.store(true); lastRadiusChange = now;
+                }
+            }
+            if (GetAsyncKeyState(VK_SUBTRACT) & 0x8000 || GetAsyncKeyState(VK_OEM_MINUS) & 0x8000) { 
+                if (std::chrono::duration<float, std::milli>(now - lastRadiusChange).count() > 50.0f) {
+                    g_circleRadius.store(std::max(currentRadius - 3, 30)); g_needsRedraw.store(true); lastRadiusChange = now;
+                }
+            }
             
-            if (GetAsyncKeyState(VK_LEFT) & 0x8000) { g_matchThreshold.store(std::max(g_matchThreshold.load() - 0.01, 0.10)); std::cout << "Threshold: " << g_matchThreshold.load() << "\n"; std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
-            if (GetAsyncKeyState(VK_RIGHT) & 0x8000) { g_matchThreshold.store(std::min(g_matchThreshold.load() + 0.01, 0.95)); std::cout << "Threshold: " << g_matchThreshold.load() << "\n"; std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
+            if (GetAsyncKeyState(VK_LEFT) & 0x8000) { g_matchThreshold.store(std::max(g_matchThreshold.load() - 0.01, 0.10)); std::cout << "[CONTROL] Threshold: " << g_matchThreshold.load() << "\n"; std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
+            if (GetAsyncKeyState(VK_RIGHT) & 0x8000) { g_matchThreshold.store(std::min(g_matchThreshold.load() + 0.01, 0.80)); std::cout << "[CONTROL] Threshold: " << g_matchThreshold.load() << "\n"; std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
             
-            if (GetAsyncKeyState(VK_UP) & 0x8000) { g_headOffset.store(g_headOffset.load() + 1); std::cout << "Head Offset: " << g_headOffset.load() << "\n"; std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
-            if (GetAsyncKeyState(VK_DOWN) & 0x8000) { g_headOffset.store(g_headOffset.load() - 1); std::cout << "Head Offset: " << g_headOffset.load() << "\n"; std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
+            if (GetAsyncKeyState(VK_UP) & 0x8000) { g_headOffset.store(g_headOffset.load() + 1); std::cout << "[CONTROL] Head Offset: " << g_headOffset.load() << "\n"; std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
+            if (GetAsyncKeyState(VK_DOWN) & 0x8000) { g_headOffset.store(g_headOffset.load() - 1); std::cout << "[CONTROL] Head Offset: " << g_headOffset.load() << "\n"; std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
             
             if (g_needsRedraw.exchange(false)) {
                 HWND hwnd = g_overlayHwnd.load();
@@ -316,7 +304,11 @@ int main() {
             capture.Cleanup(); std::this_thread::sleep_for(std::chrono::milliseconds(500));
             while (g_appRunning.load() && !capture.Init()) { std::this_thread::sleep_for(std::chrono::seconds(1)); }
             continue;
-        } else if (status != CaptureStatus::Success) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+        } else if (status == CaptureStatus::Timeout) {
+            continue; 
+        } else if (status != CaptureStatus::Success) { 
+            std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; 
+        }
 
         if (!roiFrame.empty()) {
             if (capture.IsRGBA()) cv::cvtColor(roiFrame, bgrFrame, cv::COLOR_RGBA2BGR);
@@ -324,7 +316,7 @@ int main() {
 
             cv::cvtColor(bgrFrame, grayFrame, cv::COLOR_BGR2GRAY);
             cv::cvtColor(bgrFrame, hsvFrame, cv::COLOR_BGR2HSV);
-            cv::GaussianBlur(grayFrame, grayFrame, cv::Size(3, 3), 0);
+            cv::GaussianBlur(grayFrame, grayFrame, cv::Size(5, 5), 0);
 
             int cx = roiFrame.cols / 2; int cy = roiFrame.rows / 2;
 
@@ -334,6 +326,7 @@ int main() {
                 lastMaskRadius = currentRadius;
             }
 
+            // البحث عن المؤشر الأحمر
             cv::Mat mask1, mask2, redMask, finalRedMask;
             cv::inRange(hsvFrame, cv::Scalar(0, 120, 100), cv::Scalar(10, 255, 255), mask1);
             cv::inRange(hsvFrame, cv::Scalar(170, 120, 100), cv::Scalar(180, 255, 255), mask2);
@@ -356,64 +349,86 @@ int main() {
                 }
             }
 
-            // 2. التصويب والإطلاق (فقط عند ضغط ALT)
+            // المطابقة الذكية
             if (anchorPoint.x != -1 && g_isAltPressed.load()) {
-                int searchSize = currentRadius * 2;
-                int sx = std::max(0, anchorPoint.x - searchSize / 2);
-                int sy = std::max(0, anchorPoint.y - searchSize / 2);
-                int sw = std::min(searchSize, roiFrame.cols - sx);
-                int sh = std::min(searchSize, roiFrame.rows - sy);
+                cv::Mat searchEdges;
+                cv::Canny(grayFrame, searchEdges, 40, 120);
+                cv::dilate(searchEdges, searchEdges, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(7, 7)));
+                cv::bitwise_and(searchEdges, circleMask, searchEdges); 
+
+                std::vector<std::vector<cv::Point>> contours;
+                cv::findContours(searchEdges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
                 bool foundHead = false;
-                int highestY = anchorPoint.y;
-                double bestMatchValue = 0.0;
+                int targetX = cx;
+                int targetY = cy;
+                double bestScore = 0.0;
                 double minDistanceToRed = 99999.0;
                 double threshold = g_matchThreshold.load();
+                bool foundAnyShape = false;
+                std::string lastShapeInfo = "";
 
-                if (sw > 0 && sh > 0) {
-                    cv::Mat searchArea = grayFrame(cv::Rect(sx, sy, sw, sh));
-                    cv::GaussianBlur(searchArea, blurredSearch, cv::Size(3, 3), 0);
-                    cv::Canny(blurredSearch, searchEdges, 50, 150);
-                    cv::dilate(searchEdges, searchEdges, kernel);
+                for (const auto& cnt : contours) {
+                    cv::Rect rect = cv::boundingRect(cnt);
+                    
+                    if (rect.width < 20 || rect.height < 40) continue; 
+                    double aspect = (double)rect.height / rect.width;
+                    if (aspect < 1.2 || aspect > 5.0) continue; 
 
-                    for (const auto& entry : g_templateBank) {
-                        const cv::Mat& resizedTemplate = entry.first;
-                        if (resizedTemplate.cols >= searchArea.cols || resizedTemplate.rows >= searchArea.rows) continue;
+                    double distToRed = std::hypot((rect.x + rect.width/2) - anchorPoint.x, (rect.y + rect.height/2) - anchorPoint.y);
+                    if (distToRed > currentRadius) continue;
 
-                        cv::Mat resultMat;
-                        cv::matchTemplate(searchEdges, resizedTemplate, resultMat, cv::TM_CCOEFF_NORMED);
+                    foundAnyShape = true;
 
+                    // === الإصلاح الجذري: أخذ مساحة أكبر قليلاً حول الشكل ===
+                    int padding = 10;
+                    int padX = std::max(0, rect.x - padding);
+                    int padY = std::max(0, rect.y - padding);
+                    int padW = std::min(searchEdges.cols - padX, rect.width + padding * 2);
+                    int padH = std::min(searchEdges.rows - padY, rect.height + padding * 2);
+                    
+                    cv::Mat candidateArea = searchEdges(cv::Rect(padX, padY, padW, padH));
+
+                    // === الإصلاح الجذري: تجربة أحجام متعددة دون تشويه القالب ===
+                    for (double scale = 0.5; scale <= 1.5; scale += 0.1) {
+                        cv::Mat resizedRef;
+                        // تغيير الحجم مع الحفاظ على النسبة الأصلية
+                        cv::resize(g_refTemplate, resizedRef, cv::Size(), scale, scale);
+
+                        // تجاهل إذا كان القالب أكبر من مساحة البحث
+                        if (resizedRef.cols >= candidateArea.cols || resizedRef.rows >= candidateArea.rows) continue;
+
+                        cv::Mat result;
+                        cv::matchTemplate(candidateArea, resizedRef, result, cv::TM_CCOEFF_NORMED);
                         double minVal, maxVal;
                         cv::Point minLoc, maxLoc;
-                        cv::minMaxLoc(resultMat, &minVal, &maxVal, &minLoc, &maxLoc);
+                        cv::minMaxLoc(result, &minVal, &maxVal, &minLoc, &maxLoc);
 
-                        // اختيار الأقرب للارتكاز الأحمر
-                        if (maxVal > threshold) {
-                            int matchCenterX = sx + maxLoc.x + (resizedTemplate.cols / 2);
-                            int matchCenterY = sy + maxLoc.y + (resizedTemplate.rows / 2);
-                            
-                            double distToRed = std::hypot(matchCenterX - anchorPoint.x, matchCenterY - anchorPoint.y);
+                        if (maxVal > bestScore) {
+                            bestScore = maxVal;
+                            lastShapeInfo = "Shape (W:" + std::to_string(rect.width) + ", H:" + std::to_string(rect.height) + ") Scale: " + std::to_string(scale).substr(0,4) + " Match: " + std::to_string((int)(maxVal*100)) + "%";
 
-                            if (distToRed < minDistanceToRed) {
-                                minDistanceToRed = distToRed;
-                                highestY = sy + maxLoc.y;
-                                foundHead = true;
-                                bestMatchValue = maxVal;
+                            if (maxVal > threshold) {
+                                if (distToRed < minDistanceToRed) {
+                                    minDistanceToRed = distToRed;
+                                    // التصويب على منتصف أعلى نقطة في المربع الأصلي
+                                    targetX = rect.x + (rect.width / 2);
+                                    targetY = rect.y;
+                                    foundHead = true;
+                                }
                             }
                         }
                     }
                 }
 
                 if (foundHead) {
-                    int deltaY = (highestY - cy) + g_headOffset.load();
-                    if (std::abs(deltaY) > 2 && std::abs(deltaY) < 150) {
-                        SmoothSnapToTarget(deltaY);
-                    }
+                    lastTimeTargetSeen = now; 
+                    int deltaX = targetX - cx;
+                    int deltaY = (targetY - cy) + g_headOffset.load();
                     
-                    // إطلاق النار (Hold)
-                    SetFireState(true);
+                    if (std::abs(deltaX) > 2 || std::abs(deltaY) > 2) SmoothSnapToTarget(deltaX, deltaY); 
+                    SetFireState(true); 
 
-                    // مقاومة الارتداد
                     if (g_isFiring.load()) {
                         auto currentTime = std::chrono::high_resolution_clock::now();
                         if (std::chrono::duration<float, std::milli>(currentTime - lastRecoilTime).count() > 30.0f) {
@@ -424,25 +439,35 @@ int main() {
                             lastRecoilTime = currentTime;
                         }
                     }
-                } else {
-                    SetFireState(false); // إذا لم نجد الهدف، نرفع الإصبع
-                }
 
-                if (std::chrono::duration<float, std::milli>(now - lastPrintTime).count() > 1000.0f) {
-                    std::cout << "[DEBUG] Match: " << bestMatchValue << " (Thresh: " << threshold << ") | Dist to Red: " << minDistanceToRed;
-                    if (foundHead) std::cout << " -> FIRING!\n";
-                    else std::cout << " -> NOT FOUND\n";
-                    lastPrintTime = now;
+                    if (std::chrono::duration<float, std::milli>(now - lastPrintTime).count() > 1000.0f) {
+                        std::cout << "[SUCCESS] Best: " << lastShapeInfo << " -> TARGET ACQUIRED!\n";
+                        lastPrintTime = now;
+                    }
+                } else { 
+                    auto timeSinceSeen = std::chrono::duration<float, std::milli>(now - lastTimeTargetSeen).count();
+                    if (timeSinceSeen > 150.0f) {
+                        SetFireState(false); 
+                    }
+
+                    if (std::chrono::duration<float, std::milli>(now - lastPrintTime).count() > 1000.0f) {
+                        if (foundAnyShape) {
+                            std::cout << "[DEBUG] " << lastShapeInfo << " -> IGNORED (Below Threshold " << threshold << ")\n";
+                        } else {
+                            std::cout << "[DEBUG] Searched inside circle. No shape matching human proportions found.\n";
+                        }
+                        lastPrintTime = now;
+                    }
                 }
             } else {
-                // إذا لم نجد أحمر أو لم نضغط ALT
-                SetFireState(false);
                 if (g_isAltPressed.load() && std::chrono::duration<float, std::milli>(now - lastPrintTime).count() > 1000.0f) {
-                    std::cout << "[DEBUG] No RED anchor found.\n";
+                    std::cout << "[DEBUG] Searching... No RED anchor found inside the circle.\n";
                     lastPrintTime = now;
                 }
+                SetFireState(false); 
             }
         }
+        
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
