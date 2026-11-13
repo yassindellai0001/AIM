@@ -19,28 +19,28 @@
 using Microsoft::WRL::ComPtr;
 
 // =====================================================================
-// Global Thread-Safe Variables
+// Global Thread-Safe Variables & Tunable Settings
 // =====================================================================
 std::atomic<bool> g_appRunning(true);
 std::atomic<int> g_circleRadius(120);
-std::atomic<bool> g_isFiring(false);
+std::atomic<bool> g_isFiring(false); // حالة زر الإطلاق
 std::atomic<bool> g_isAltPressed(false);
 std::atomic<bool> g_needsRedraw(false);
-
-std::atomic<int> g_overlayState(0); // 0=Init, 1=Success, -1=Failed
+std::atomic<int> g_overlayState(0); 
 std::atomic<DWORD> g_overlayThreadId(0);
 std::atomic<HWND> g_overlayHwnd(nullptr);
 const int TRIGGER_KEY = VK_MENU; // ALT
 
 std::vector<std::pair<cv::Mat, double>> g_templateBank;
 auto lastRecoilTime = std::chrono::high_resolution_clock::now();
+
+// إعدادات قابلة للتعديل أثناء اللعب
+std::atomic<double> g_matchThreshold(0.45); 
+std::atomic<int> g_headOffset(0);           
 // =====================================================================
 
 enum class CaptureStatus { Success, Timeout, AccessLost, Error, InvalidROI };
 
-// =====================================================================
-// RAII Wrappers (Strict Resource Safety)
-// =====================================================================
 class DXGIFrameLocker {
 private:
     IDXGIOutputDuplication* duplication;
@@ -58,9 +58,6 @@ public:
     ~DXGIMapLocker() { if (context && resource) context->Unmap(resource, 0); }
 };
 
-// =====================================================================
-// DXGI Capture Engine
-// =====================================================================
 class DXGICaptureEngine {
 private:
     ComPtr<ID3D11Device> device;
@@ -68,10 +65,8 @@ private:
     ComPtr<IDXGIOutputDuplication> deskDupl;
     ComPtr<ID3D11Texture2D> stagingTex;
     
-    int texWidth = 0; 
-    int texHeight = 0;
+    int texWidth = 0; int texHeight = 0;
     DXGI_FORMAT texFormat = DXGI_FORMAT_UNKNOWN; 
-    
     bool isInitialized = false;
     bool isRGBA = false;
 
@@ -133,19 +128,10 @@ public:
 
         D3D11_MAPPED_SUBRESOURCE mapped = { 0 };
         hr = context->Map(stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-        
-        // === الإصلاح الجذري: التحقق من FAILED أولاً ===
-        if (FAILED(hr)) {
-            return CaptureStatus::Error; 
-        }
+        if (FAILED(hr)) return CaptureStatus::Error; 
 
-        // بما أن hr نجح، يجب علينا الآن ضمان استدعاء Unmap في كل الحالات
         DXGIMapLocker mapLocker(context.Get(), stagingTex.Get());
-
-        // الآن يمكننا فحص المؤشر بأمان (إذا كان فارغاً، الـ RAII سيتكفل بالتنظيف)
-        if (mapped.pData == nullptr) {
-            return CaptureStatus::Error;
-        }
+        if (mapped.pData == nullptr) return CaptureStatus::Error;
 
         int centerX = desc.Width / 2; int centerY = desc.Height / 2;
         int fov = currentRadius + 20;
@@ -157,7 +143,6 @@ public:
 
         cv::Mat fullFrame(desc.Height, desc.Width, CV_8UC4, mapped.pData, mapped.RowPitch);
         outFrame = fullFrame(roi).clone();
-
         return CaptureStatus::Success;
     }
 
@@ -168,16 +153,23 @@ public:
     }
 };
 
-// =====================================================================
-// Input & Helper Functions
-// =====================================================================
-void SnapToTarget(int deltaY) {
-    if (std::abs(deltaY) < 1) return;
-    INPUT input = { 0 }; input.type = INPUT_MOUSE;
-    input.mi.dy = deltaY; input.mi.dwFlags = MOUSEEVENTF_MOVE;
-    SendInput(1, &input, sizeof(INPUT));
+// حركة ماوس ناعمة (للتخفي)
+void SmoothSnapToTarget(int deltaY) {
+    if (std::abs(deltaY) < 2) return;
+    int steps = 3; 
+    int stepY = deltaY / steps;
+    
+    for (int i = 0; i < steps; i++) {
+        INPUT input = { 0 }; 
+        input.type = INPUT_MOUSE;
+        input.mi.dy = (i == steps - 1) ? (deltaY - stepY * (steps - 1)) : stepY; 
+        input.mi.dwFlags = MOUSEEVENTF_MOVE;
+        SendInput(1, &input, sizeof(INPUT));
+        std::this_thread::sleep_for(std::chrono::microseconds(300)); 
+    }
 }
 
+// إطلاق النار (Hold)
 void SetFireState(bool fire) {
     if (fire && !g_isFiring.load()) {
         INPUT click = { 0 }; click.type = INPUT_MOUSE; click.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
@@ -188,9 +180,6 @@ void SetFireState(bool fire) {
     }
 }
 
-// =====================================================================
-// Overlay Window
-// =====================================================================
 LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     if (uMsg == WM_ERASEBKGND) return 1;
     if (uMsg == WM_PAINT) {
@@ -215,37 +204,17 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
 void OverlayThread() {
     g_overlayThreadId.store(GetCurrentThreadId());
-
-    WNDCLASS wc = { 0 }; 
-    wc.lpfnWndProc = OverlayProc; 
-    wc.hInstance = GetModuleHandle(NULL);
-    wc.lpszClassName = "AimbotOverlay"; 
-    
-    if (!RegisterClass(&wc)) {
-        g_overlayState.store(-1);
-        return;
-    }
-
+    WNDCLASS wc = { 0 }; wc.lpfnWndProc = OverlayProc; wc.hInstance = GetModuleHandle(NULL); wc.lpszClassName = "AimbotOverlay"; 
+    if (!RegisterClass(&wc)) { g_overlayState.store(-1); return; }
     HWND hwnd = CreateWindowEx(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         "AimbotOverlay", "Overlay", WS_POPUP, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), NULL, NULL, wc.hInstance, NULL);
-
-    if (!hwnd) {
-        UnregisterClass("AimbotOverlay", wc.hInstance);
-        g_overlayState.store(-1);
-        return;
-    }
-
+    if (!hwnd) { UnregisterClass("AimbotOverlay", wc.hInstance); g_overlayState.store(-1); return; }
     g_overlayHwnd.store(hwnd);
     SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
     ShowWindow(hwnd, SW_SHOW);
-    
     g_overlayState.store(1);
-
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0) > 0) {
-        TranslateMessage(&msg); DispatchMessage(&msg);
-    }
-    
+    while (GetMessage(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessage(&msg); }
     if (IsWindow(hwnd)) DestroyWindow(hwnd);
     UnregisterClass("AimbotOverlay", wc.hInstance);
 }
@@ -253,11 +222,9 @@ void OverlayThread() {
 BOOL WINAPI ConsoleHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT) {
         g_appRunning.store(false);
-        
         HWND hwnd = g_overlayHwnd.load();
-        if (hwnd && PostMessage(hwnd, WM_CLOSE, 0, 0)) {
-            // WM_CLOSE سيؤدي إلى WM_DESTROY ثم WM_QUIT
-        } else {
+        if (hwnd && PostMessage(hwnd, WM_CLOSE, 0, 0)) {}
+        else {
             DWORD threadId = g_overlayThreadId.load();
             if (threadId != 0) PostThreadMessage(threadId, WM_QUIT, 0, 0);
         }
@@ -266,11 +233,13 @@ BOOL WINAPI ConsoleHandler(DWORD signal) {
     return FALSE;
 }
 
-// =====================================================================
-// Main Function
-// =====================================================================
 int main() {
-    std::cout << "[+] Starting Ultimate Aimbot (V36.0)...\n";
+    std::cout << "[+] Starting Full Auto-Aim & Fire (V42.0)...\n";
+    std::cout << "[CONTROLS] +/- : Circle Size\n";
+    std::cout << "[CONTROLS] LEFT/RIGHT Arrows : Match Threshold\n";
+    std::cout << "[CONTROLS] UP/DOWN Arrows : Head Offset\n";
+    std::cout << "[INFO] Hold [ALT] to Aim and Fire.\n";
+
     SetConsoleCtrlHandler(ConsoleHandler, TRUE);
     
     cv::Mat rawTemplate = cv::imread("enemy_template.png", cv::IMREAD_GRAYSCALE);
@@ -279,75 +248,59 @@ int main() {
         return 1;
     }
 
+    cv::threshold(rawTemplate, rawTemplate, 240, 255, cv::THRESH_TOZERO_INV);
     int cropHeight = (int)(rawTemplate.rows * 0.70);
     if (cropHeight > 10) rawTemplate = rawTemplate(cv::Rect(0, 0, rawTemplate.cols, cropHeight)).clone();
     
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2)); 
     for (double scale = 0.3; scale <= 1.8; scale += 0.1) {
-        cv::Mat resized;
+        cv::Mat resized, blurred, edges;
         cv::resize(rawTemplate, resized, cv::Size(), scale, scale);
-        cv::Canny(resized, resized, 50, 150);
-        g_templateBank.push_back({ resized, scale });
+        cv::GaussianBlur(resized, blurred, cv::Size(3, 3), 0);
+        cv::Canny(blurred, edges, 50, 150);
+        cv::dilate(edges, edges, kernel);
+        g_templateBank.push_back({ edges, scale });
     }
-    std::cout << "[+] Template Bank ready (" << g_templateBank.size() << " scales).\n";
+    std::cout << "[+] Template Bank ready.\n";
 
     std::thread overlayTh(OverlayThread);
-    
-    while (g_overlayState.load() == 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-
-    if (g_overlayState.load() == -1) {
-        std::cerr << "[-] FATAL: Failed to create Overlay window. Exiting.\n";
-        if (overlayTh.joinable()) overlayTh.join();
-        return 1;
-    }
-    std::cout << "[+] Overlay Initialized.\n";
+    while (g_overlayState.load() == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+    if (g_overlayState.load() == -1) { std::cerr << "[-] FATAL: Overlay failed.\n"; if (overlayTh.joinable()) overlayTh.join(); return 1; }
 
     DXGICaptureEngine capture;
-    int retryCount = 0;
-    while (g_appRunning.load() && !capture.Init() && retryCount < 5) {
-        std::cout << "[-] DXGI Init Failed. Retrying in 2s (" << (retryCount + 1) << "/5)...\n";
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        retryCount++;
-    }
+    while (g_appRunning.load() && !capture.Init()) { std::this_thread::sleep_for(std::chrono::seconds(2)); }
+    if (!capture.IsInitialized()) { g_appRunning.store(false); if (overlayTh.joinable()) overlayTh.join(); return 1; }
 
-    if (!capture.IsInitialized()) {
-        std::cerr << "[-] FATAL: Failed to initialize DXGI after 5 attempts. Exiting.\n";
-        g_appRunning.store(false);
-        
-        HWND hwnd = g_overlayHwnd.load();
-        if (hwnd && PostMessage(hwnd, WM_CLOSE, 0, 0)) {
-            // Good
-        } else {
-            DWORD threadId = g_overlayThreadId.load();
-            if (threadId != 0) PostThreadMessage(threadId, WM_QUIT, 0, 0);
-        }
-        
-        if (overlayTh.joinable()) overlayTh.join();
-        return 1;
-    }
-
-    std::cout << "[+] Engine Initialized. Hold [ALT] to aim.\n";
+    std::cout << "[+] Engine Initialized. Hold [ALT] to aim & fire.\n";
     auto lastInputCheck = std::chrono::high_resolution_clock::now();
     
-    cv::Mat roiFrame, bgrFrame, grayFrame, hsvFrame, circleMask, searchEdges;
+    cv::Mat roiFrame, bgrFrame, grayFrame, hsvFrame, circleMask, blurredSearch, searchEdges;
     std::vector<std::vector<cv::Point>> redContours;
     int lastMaskRadius = -1;
-    
     auto lastPrintTime = std::chrono::high_resolution_clock::now();
-    bool printedRedAnchor = false;
 
     while (g_appRunning.load()) {
         auto now = std::chrono::high_resolution_clock::now();
         
-        if (std::chrono::duration<float, std::milli>(now - lastInputCheck).count() > 10.0f) {
+        // 1. التحقق من المدخلات
+        if (std::chrono::duration<float, std::milli>(now - lastInputCheck).count() > 20.0f) {
             bool altState = (GetAsyncKeyState(TRIGGER_KEY) & 0x8000) != 0;
             g_isAltPressed.store(altState);
-            if (!altState) SetFireState(false);
+            
+            // إذا تم رفع الإصبع عن ALT، نوقف الإطلاق فوراً
+            if (!altState) {
+                SetFireState(false);
+            }
 
             int currentRadius = g_circleRadius.load();
-            if (GetAsyncKeyState(VK_ADD) & 0x8000 || GetAsyncKeyState(VK_OEM_PLUS) & 0x8000) { g_circleRadius.store(std::min(currentRadius + 3, 500)); g_needsRedraw.store(true); }
-            if (GetAsyncKeyState(VK_SUBTRACT) & 0x8000 || GetAsyncKeyState(VK_OEM_MINUS) & 0x8000) { g_circleRadius.store(std::max(currentRadius - 3, 30)); g_needsRedraw.store(true); }
+            if (GetAsyncKeyState(VK_ADD) & 0x8000) { g_circleRadius.store(std::min(currentRadius + 3, 500)); g_needsRedraw.store(true); }
+            if (GetAsyncKeyState(VK_SUBTRACT) & 0x8000) { g_circleRadius.store(std::max(currentRadius - 3, 30)); g_needsRedraw.store(true); }
+            
+            if (GetAsyncKeyState(VK_LEFT) & 0x8000) { g_matchThreshold.store(std::max(g_matchThreshold.load() - 0.01, 0.10)); std::cout << "Threshold: " << g_matchThreshold.load() << "\n"; std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
+            if (GetAsyncKeyState(VK_RIGHT) & 0x8000) { g_matchThreshold.store(std::min(g_matchThreshold.load() + 0.01, 0.95)); std::cout << "Threshold: " << g_matchThreshold.load() << "\n"; std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
+            
+            if (GetAsyncKeyState(VK_UP) & 0x8000) { g_headOffset.store(g_headOffset.load() + 1); std::cout << "Head Offset: " << g_headOffset.load() << "\n"; std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
+            if (GetAsyncKeyState(VK_DOWN) & 0x8000) { g_headOffset.store(g_headOffset.load() - 1); std::cout << "Head Offset: " << g_headOffset.load() << "\n"; std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
             
             if (g_needsRedraw.exchange(false)) {
                 HWND hwnd = g_overlayHwnd.load();
@@ -360,22 +313,10 @@ int main() {
         CaptureStatus status = capture.GrabFrame(roiFrame, currentRadius);
         
         if (status == CaptureStatus::AccessLost) {
-            capture.Cleanup(); 
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            int reinitRetries = 0;
-            while (g_appRunning.load() && !capture.Init() && reinitRetries < 5) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                reinitRetries++;
-            }
-            if (!capture.IsInitialized()) {
-                std::cerr << "[-] FATAL: Lost DXGI access and failed to recover. Exiting.\n";
-                g_appRunning.store(false);
-            }
+            capture.Cleanup(); std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            while (g_appRunning.load() && !capture.Init()) { std::this_thread::sleep_for(std::chrono::seconds(1)); }
             continue;
-        } else if (status != CaptureStatus::Success) { 
-            std::this_thread::sleep_for(std::chrono::milliseconds(1)); 
-            continue; 
-        }
+        } else if (status != CaptureStatus::Success) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
 
         if (!roiFrame.empty()) {
             if (capture.IsRGBA()) cv::cvtColor(roiFrame, bgrFrame, cv::COLOR_RGBA2BGR);
@@ -415,13 +356,8 @@ int main() {
                 }
             }
 
+            // 2. التصويب والإطلاق (فقط عند ضغط ALT)
             if (anchorPoint.x != -1 && g_isAltPressed.load()) {
-                if (std::chrono::duration<float, std::milli>(now - lastPrintTime).count() > 1000.0f) {
-                    std::cout << "[DEBUG] Red Anchor Found. Searching shape...\n";
-                    lastPrintTime = now;
-                    printedRedAnchor = true;
-                }
-
                 int searchSize = currentRadius * 2;
                 int sx = std::max(0, anchorPoint.x - searchSize / 2);
                 int sy = std::max(0, anchorPoint.y - searchSize / 2);
@@ -431,10 +367,14 @@ int main() {
                 bool foundHead = false;
                 int highestY = anchorPoint.y;
                 double bestMatchValue = 0.0;
+                double minDistanceToRed = 99999.0;
+                double threshold = g_matchThreshold.load();
 
                 if (sw > 0 && sh > 0) {
                     cv::Mat searchArea = grayFrame(cv::Rect(sx, sy, sw, sh));
-                    cv::Canny(searchArea, searchEdges, 50, 150);
+                    cv::GaussianBlur(searchArea, blurredSearch, cv::Size(3, 3), 0);
+                    cv::Canny(blurredSearch, searchEdges, 50, 150);
+                    cv::dilate(searchEdges, searchEdges, kernel);
 
                     for (const auto& entry : g_templateBank) {
                         const cv::Mat& resizedTemplate = entry.first;
@@ -447,33 +387,33 @@ int main() {
                         cv::Point minLoc, maxLoc;
                         cv::minMaxLoc(resultMat, &minVal, &maxVal, &minLoc, &maxLoc);
 
-                        if (maxVal > bestMatchValue) bestMatchValue = maxVal;
-
-                        if (maxVal > 0.65) {
+                        // اختيار الأقرب للارتكاز الأحمر
+                        if (maxVal > threshold) {
                             int matchCenterX = sx + maxLoc.x + (resizedTemplate.cols / 2);
                             int matchCenterY = sy + maxLoc.y + (resizedTemplate.rows / 2);
-                            double dist = std::hypot(matchCenterX - cx, matchCenterY - cy);
+                            
+                            double distToRed = std::hypot(matchCenterX - anchorPoint.x, matchCenterY - anchorPoint.y);
 
-                            if (dist <= currentRadius) {
+                            if (distToRed < minDistanceToRed) {
+                                minDistanceToRed = distToRed;
                                 highestY = sy + maxLoc.y;
                                 foundHead = true;
-                                break;
+                                bestMatchValue = maxVal;
                             }
                         }
                     }
                 }
 
-                if (std::chrono::duration<float, std::milli>(now - lastPrintTime).count() > 1000.0f || (!foundHead && printedRedAnchor)) {
-                    std::cout << "[DEBUG] Match Value: " << bestMatchValue << " | " << (foundHead ? "TARGET ACQUIRED!" : "Not recognized (0.65 required).") << "\n";
-                    lastPrintTime = now;
-                    printedRedAnchor = false;
-                }
-
                 if (foundHead) {
-                    int deltaY = highestY - cy;
-                    if (std::abs(deltaY) > 2 && std::abs(deltaY) < 150) SnapToTarget(deltaY);
+                    int deltaY = (highestY - cy) + g_headOffset.load();
+                    if (std::abs(deltaY) > 2 && std::abs(deltaY) < 150) {
+                        SmoothSnapToTarget(deltaY);
+                    }
+                    
+                    // إطلاق النار (Hold)
                     SetFireState(true);
 
+                    // مقاومة الارتداد
                     if (g_isFiring.load()) {
                         auto currentTime = std::chrono::high_resolution_clock::now();
                         if (std::chrono::duration<float, std::milli>(currentTime - lastRecoilTime).count() > 30.0f) {
@@ -484,32 +424,35 @@ int main() {
                             lastRecoilTime = currentTime;
                         }
                     }
-                } else { SetFireState(false); }
-            } else {
-                if (g_isAltPressed.load() && std::chrono::duration<float, std::milli>(now - lastPrintTime).count() > 1000.0f) {
-                    std::cout << "[DEBUG] No RED anchor found inside circle.\n";
+                } else {
+                    SetFireState(false); // إذا لم نجد الهدف، نرفع الإصبع
+                }
+
+                if (std::chrono::duration<float, std::milli>(now - lastPrintTime).count() > 1000.0f) {
+                    std::cout << "[DEBUG] Match: " << bestMatchValue << " (Thresh: " << threshold << ") | Dist to Red: " << minDistanceToRed;
+                    if (foundHead) std::cout << " -> FIRING!\n";
+                    else std::cout << " -> NOT FOUND\n";
                     lastPrintTime = now;
                 }
-                SetFireState(false); 
+            } else {
+                // إذا لم نجد أحمر أو لم نضغط ALT
+                SetFireState(false);
+                if (g_isAltPressed.load() && std::chrono::duration<float, std::milli>(now - lastPrintTime).count() > 1000.0f) {
+                    std::cout << "[DEBUG] No RED anchor found.\n";
+                    lastPrintTime = now;
+                }
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    std::cout << "[+] Shutting down gracefully...\n";
     g_appRunning.store(false);
-    
     HWND hwnd = g_overlayHwnd.load();
-    if (hwnd && PostMessage(hwnd, WM_CLOSE, 0, 0)) {
-        // Good
-    } else {
+    if (hwnd && PostMessage(hwnd, WM_CLOSE, 0, 0)) {} else {
         DWORD threadId = g_overlayThreadId.load();
         if (threadId != 0) PostThreadMessage(threadId, WM_QUIT, 0, 0);
     }
-    
     if (overlayTh.joinable()) overlayTh.join();
-    
     capture.Cleanup();
-    std::cout << "[+] Clean exit.\n";
     return 0;
 }
