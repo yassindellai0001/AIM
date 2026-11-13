@@ -30,7 +30,6 @@ std::atomic<HWND> g_overlayHwnd(nullptr);
 std::atomic<bool> g_needsRedraw(false);
 const int TRIGGER_KEY = VK_MENU; // ALT
 
-// Bank of pre-scaled templates to save CPU
 std::vector<std::pair<cv::Mat, double>> g_templateBank;
 auto lastRecoilTime = std::chrono::high_resolution_clock::now();
 // =====================================================================
@@ -90,7 +89,6 @@ public:
         if (hr == DXGI_ERROR_ACCESS_LOST) return CaptureStatus::AccessLost;
         if (FAILED(hr)) return CaptureStatus::Error;
 
-        // RAII ensures ReleaseFrame is called
         DXGIFrameLocker frameLocker(deskDupl.Get());
 
         ComPtr<ID3D11Texture2D> acquiredImage;
@@ -119,7 +117,8 @@ public:
         cv::Rect roi(centerX - fov, centerY - fov, fov * 2, fov * 2);
         
         if (roi.x >= 0 && roi.y >= 0 && roi.x + roi.width <= (int)desc.Width && roi.y + roi.height <= (int)desc.Height) {
-            cv::Mat fullFrame(desc.Height, desc.Width, CV_8UC4, mapped.pData, mapped.pRowPitch);
+            // الإصلاح هنا: RowPitch بدلاً من pRowPitch
+            cv::Mat fullFrame(desc.Height, desc.Width, CV_8UC4, mapped.pData, mapped.RowPitch);
             outFrame = fullFrame(roi).clone();
         }
 
@@ -199,19 +198,16 @@ void OverlayThread() {
         while (GetMessage(&msg, NULL, 0, 0) > 0) {
             TranslateMessage(&msg); DispatchMessage(&msg);
         }
-        DestroyWindow(hwnd); // Proper cleanup
+        DestroyWindow(hwnd);
     }
     UnregisterClass("AimbotOverlay", wc.hInstance);
 }
 
-// =====================================================================
-// Console Close Handler (Organized Shutdown)
-// =====================================================================
 BOOL WINAPI ConsoleHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT) {
-        g_appRunning.store(false); // إيقاف الحلقة الرئيسية
+        g_appRunning.store(false);
         HWND hwnd = g_overlayHwnd.load();
-        if (hwnd) PostMessage(hwnd, WM_CLOSE, 0, 0); // إغلاق الـ Overlay
+        if (hwnd) PostMessage(hwnd, WM_CLOSE, 0, 0);
         return TRUE;
     }
     return FALSE;
@@ -221,7 +217,7 @@ BOOL WINAPI ConsoleHandler(DWORD signal) {
 // Main Function
 // =====================================================================
 int main() {
-    std::cout << "[+] Starting Optimized Aimbot (V28.0)...\n";
+    std::cout << "[+] Starting Optimized Aimbot (V28.1)...\n";
     SetConsoleCtrlHandler(ConsoleHandler, TRUE);
     
     cv::Mat rawTemplate = cv::imread("enemy_template.png", cv::IMREAD_GRAYSCALE);
@@ -230,11 +226,9 @@ int main() {
         return 1;
     }
 
-    // 1. قص 70% وتحويل القالب الأساسي
     int cropHeight = (int)(rawTemplate.rows * 0.70);
     if (cropHeight > 10) rawTemplate = rawTemplate(cv::Rect(0, 0, rawTemplate.cols, cropHeight)).clone();
     
-    // 2. بناء بنك القوالب مسبقاً (Template Bank) لتوفير المعالج
     for (double scale = 0.3; scale <= 1.8; scale += 0.1) {
         cv::Mat resized;
         cv::resize(rawTemplate, resized, cv::Size(), scale, scale);
@@ -253,7 +247,6 @@ int main() {
     std::cout << "[+] Engine Initialized. Hold [ALT] to aim.\n";
     auto lastInputCheck = std::chrono::high_resolution_clock::now();
     
-    // 3. حجز الذاكرة مسبقاً (Zero-Allocation in loop)
     cv::Mat roiFrame, bgrFrame, grayFrame, hsvFrame, circleMask, searchEdges;
     std::vector<std::vector<cv::Point>> redContours;
     int lastMaskRadius = -1;
@@ -261,7 +254,6 @@ int main() {
     while (g_appRunning.load()) {
         auto now = std::chrono::high_resolution_clock::now();
         
-        // إدارة المدخلات
         if (std::chrono::duration<float, std::milli>(now - lastInputCheck).count() > 10.0f) {
             bool altState = (GetAsyncKeyState(TRIGGER_KEY) & 0x8000) != 0;
             g_isAltPressed.store(altState);
@@ -295,15 +287,13 @@ int main() {
         }
 
         if (!roiFrame.empty()) {
-            // 4. تحسين تحويل الألوان: BGRA -> BGR مرة واحدة، ثم BGR -> Gray/HSV
             cv::cvtColor(roiFrame, bgrFrame, cv::COLOR_BGRA2BGR);
             cv::cvtColor(bgrFrame, grayFrame, cv::COLOR_BGR2GRAY);
             cv::cvtColor(bgrFrame, hsvFrame, cv::COLOR_BGR2HSV);
-            cv::GaussianBlur(grayFrame, grayFrame, cv::Size(3, 3), 0); // تقليل الضوضاء
+            cv::GaussianBlur(grayFrame, grayFrame, cv::Size(3, 3), 0);
 
             int cx = roiFrame.cols / 2; int cy = roiFrame.rows / 2;
 
-            // 5. إعادة استخدام قناع الدائرة (فقط إذا تغير الحجم)
             if (currentRadius != lastMaskRadius) {
                 circleMask = cv::Mat::zeros(roiFrame.size(), CV_8UC1);
                 cv::circle(circleMask, cv::Point(cx, cy), currentRadius, cv::Scalar(255), -1);
@@ -346,7 +336,6 @@ int main() {
                     cv::Mat searchArea = grayFrame(cv::Rect(sx, sy, sw, sh));
                     cv::Canny(searchArea, searchEdges, 50, 150);
 
-                    // 6. استخدام بنك القوالب الجاهز بدلاً من resize
                     for (const auto& entry : g_templateBank) {
                         const cv::Mat& resizedTemplate = entry.first;
                         if (resizedTemplate.cols >= searchArea.cols || resizedTemplate.rows >= searchArea.rows) continue;
@@ -361,7 +350,9 @@ int main() {
                         if (maxVal > 0.65) {
                             int matchCenterX = sx + maxLoc.x + (resizedTemplate.cols / 2);
                             int matchCenterY = sy + maxLoc.y + (resizedTemplate.rows / 2);
-                            float dist = std::hypot(matchCenterX - cx, matchCenterY - cy);
+                            
+                            // إصلاح التحذير: تغيير float إلى double
+                            double dist = std::hypot(matchCenterX - cx, matchCenterY - cy);
 
                             if (dist <= currentRadius) {
                                 highestY = sy + maxLoc.y;
@@ -393,7 +384,6 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    // مسار الإغلاق المنظم
     std::cout << "[+] Shutting down gracefully...\n";
     g_appRunning.store(false);
     
