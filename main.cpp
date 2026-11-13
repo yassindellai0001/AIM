@@ -7,8 +7,8 @@
 #include <chrono>
 #include <thread>
 #include <cmath>
-#include <random>
 #include <vector>
+#include <mutex>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -16,13 +16,18 @@
 
 // ================= المتغيرات العامة =================
 int g_circleRadius = 80; 
+int g_headOffset = 0; 
 const int TRIGGER_KEY = VK_MENU; // ALT
 bool g_isFiring = false;
-bool g_isHeadFound = false; 
 bool g_isAltPressed = false; 
+
+// متغيرات لرسم المربع الأبيض حول "جسم اللاعب"
+std::mutex g_boxMutex;
+cv::Rect g_targetBox = cv::Rect(0, 0, 0, 0);
+bool g_hasTarget = false;
 // =====================================================
 
-// نافذة الرسم (الدائرة الخضراء فقط)
+// نافذة الرسم (الدائرة الخضراء + المربع الأبيض حول اللاعب)
 LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     if (uMsg == WM_ERASEBKGND) return 1; 
     if (uMsg == WM_PAINT) {
@@ -34,6 +39,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         int screenW = GetSystemMetrics(SM_CXSCREEN); int screenH = GetSystemMetrics(SM_CYSCREEN);
         int cx = screenW / 2; int cy = screenH / 2;
 
+        // 1. رسم الدائرة الخضراء
         HPEN hGreenPen = CreatePen(PS_SOLID, 2, RGB(0, 255, 0));
         HGDIOBJ oldPen = SelectObject(hdc, hGreenPen);
         HBRUSH hNullBrush = (HBRUSH)GetStockObject(NULL_BRUSH); 
@@ -42,6 +48,22 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         Ellipse(hdc, cx - g_circleRadius, cy - g_circleRadius, cx + g_circleRadius, cy + g_circleRadius);
         MoveToEx(hdc, cx - 5, cy, NULL); LineTo(hdc, cx + 5, cy);
         MoveToEx(hdc, cx, cy - 5, NULL); LineTo(hdc, cx, cy + 5);
+
+        // 2. رسم المربع الأبيض حول "اللاعب"
+        {
+            std::lock_guard<std::mutex> lock(g_boxMutex);
+            if (g_hasTarget && g_targetBox.width > 0) {
+                HPEN hWhitePen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+                SelectObject(hdc, hWhitePen);
+                
+                int boxX = (cx - g_circleRadius) + g_targetBox.x;
+                int boxY = (cy - g_circleRadius) + g_targetBox.y;
+                
+                // رسم المربع حول جسم اللاعب (وليس حول المؤشر)
+                Rectangle(hdc, boxX, boxY, boxX + g_targetBox.width, boxY + g_targetBox.height);
+                DeleteObject(hWhitePen);
+            }
+        }
 
         SelectObject(hdc, oldPen); SelectObject(hdc, oldBrush); DeleteObject(hGreenPen);
         EndPaint(hwnd, &ps); return 0;
@@ -59,7 +81,7 @@ void StartOverlay() {
     MSG msg; while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
 }
 
-// محرك الالتقاط (DXGI)
+// محرك الالتقاط
 class DXGICaptureEngine {
 private:
     ID3D11Device* device = nullptr; ID3D11DeviceContext* context = nullptr;
@@ -110,7 +132,7 @@ public:
     }
 };
 
-// التصويب والإطلاق
+// التصويب
 void SnapToTarget(int deltaX, int deltaY) {
     INPUT input = { 0 }; input.type = INPUT_MOUSE;
     input.mi.dx = deltaX; input.mi.dy = deltaY; input.mi.dwFlags = MOUSEEVENTF_MOVE;
@@ -128,7 +150,7 @@ void SetFireState(bool fire) {
 }
 
 int main() {
-    std::cout << "[+] Starting Smart Edge Aimbot (V6.1)...\n";
+    std::cout << "[+] Starting Final Visual Aimbot (V13.0)...\n";
     std::thread overlayThread(StartOverlay); overlayThread.detach();
     
     DXGICaptureEngine capture; cv::Mat roiFrame;
@@ -136,13 +158,20 @@ int main() {
     std::cout << "[+] Engine Initialized. Hold [ALT] to aim.\n";
 
     auto lastInputCheck = std::chrono::high_resolution_clock::now();
+    HWND overlayHwnd = NULL;
 
     while (true) {
+        if (!overlayHwnd) overlayHwnd = FindWindow("AimbotOverlay", NULL);
+
         auto now = std::chrono::high_resolution_clock::now();
         if (std::chrono::duration<float, std::milli>(now - lastInputCheck).count() > 15.0f) {
             g_isAltPressed = (GetAsyncKeyState(TRIGGER_KEY) & 0x8000) != 0;
-            if (GetAsyncKeyState(VK_ADD) & 0x8000 || GetAsyncKeyState(VK_OEM_PLUS) & 0x8000) { g_circleRadius += 2; }
-            if (GetAsyncKeyState(VK_SUBTRACT) & 0x8000 || GetAsyncKeyState(VK_OEM_MINUS) & 0x8000) { g_circleRadius -= 2; if(g_circleRadius < 20) g_circleRadius = 20; }
+            
+            if (GetAsyncKeyState(VK_ADD) & 0x8000 || GetAsyncKeyState(VK_OEM_PLUS) & 0x8000 || GetAsyncKeyState(VK_OEM_6) & 0x8000) { g_circleRadius += 3; }
+            if (GetAsyncKeyState(VK_SUBTRACT) & 0x8000 || GetAsyncKeyState(VK_OEM_MINUS) & 0x8000 || GetAsyncKeyState(VK_OEM_4) & 0x8000) { g_circleRadius -= 3; if(g_circleRadius < 20) g_circleRadius = 20; }
+            if (GetAsyncKeyState(VK_UP) & 0x8000) { g_headOffset++; }
+            if (GetAsyncKeyState(VK_DOWN) & 0x8000) { g_headOffset--; if(g_headOffset < -30) g_headOffset = -30; }
+            
             lastInputCheck = now;
         }
 
@@ -154,85 +183,90 @@ int main() {
         if (status == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
 
         if (status == 1 && !roiFrame.empty()) {
-            cv::Mat hsvFrame, grayFrame;
-            cv::cvtColor(roiFrame, hsvFrame, cv::COLOR_BGRA2BGR);
-            cv::cvtColor(hsvFrame, hsvFrame, cv::COLOR_BGR2HSV);
-            cv::cvtColor(roiFrame, grayFrame, cv::COLOR_BGRA2GRAY);
+            cv::Mat bgrFrame, hsvFrame;
+            cv::cvtColor(roiFrame, bgrFrame, cv::COLOR_BGRA2BGR);
+            cv::cvtColor(bgrFrame, hsvFrame, cv::COLOR_BGR2HSV);
 
-            // قناع الدائرة الخضراء (نرى فقط داخلها)
-            cv::Mat circleMask = cv::Mat::zeros(roiFrame.size(), CV_8UC1);
-            cv::circle(circleMask, cv::Point(roiFrame.cols / 2, roiFrame.rows / 2), g_circleRadius, cv::Scalar(255), -1);
+            int cx = roiFrame.cols / 2;
+            int cy = roiFrame.rows / 2;
 
-            // البحث عن المؤشر الأحمر
-            cv::Mat mask1, mask2, redMask, finalRedMask;
-            cv::inRange(hsvFrame, cv::Scalar(0, 120, 100), cv::Scalar(10, 255, 255), mask1);
-            cv::inRange(hsvFrame, cv::Scalar(170, 120, 100), cv::Scalar(180, 255, 255), mask2);
-            cv::bitwise_or(mask1, mask2, redMask);
-            cv::bitwise_and(redMask, circleMask, finalRedMask);
+            // 1. التحقق من "المؤشر" (هل المنتصف أحمر؟)
+            cv::Vec3b centerPixel = hsvFrame.at<cv::Vec3b>(cy, cx);
+            int H = centerPixel[0], S = centerPixel[1], V = centerPixel[2];
+            bool isTargeting = ((H >= 0 && H <= 10) || (H >= 170 && H <= 180)) && (S > 120) && (V > 100);
 
-            std::vector<std::vector<cv::Point>> redContours;
-            cv::findContours(finalRedMask, redContours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+            bool foundBody = false;
+            int highestY = cy;
+            cv::Rect detectedBox;
 
-            cv::Point crosshair(-1, -1);
-            for (const auto& cnt : redContours) {
-                if (cv::contourArea(cnt) >= 3) {
-                    cv::Rect rect = cv::boundingRect(cnt);
-                    crosshair = cv::Point(rect.x + rect.width / 2, rect.y + rect.height / 2);
-                    break; 
-                }
-            }
+            // 2. إذا كان المؤشر أحمر، نبحث عن "جسم" (بكسلات مختلفة عن الخلفية)
+            if (isTargeting) {
+                cv::Rect bgPatch(cx - g_circleRadius + 5, cy - g_circleRadius + 5, 10, 10);
+                if (bgPatch.x >= 0 && bgPatch.y >= 0 && bgPatch.x + bgPatch.width <= roiFrame.cols && bgPatch.y + bgPatch.height <= roiFrame.rows) {
+                    cv::Scalar bgColor = cv::mean(bgrFrame(bgPatch));
 
-            bool foundHead = false;
-            int headY = crosshair.y;
+                    cv::Mat diffMask;
+                    cv::absdiff(bgrFrame, bgColor, diffMask);
+                    cv::Mat grayDiff;
+                    cv::cvtColor(diffMask, grayDiff, cv::COLOR_BGR2GRAY);
+                    
+                    cv::Mat colorThreshold;
+                    cv::threshold(grayDiff, colorThreshold, 40, 255, cv::THRESH_BINARY);
 
-            // إذا وجدنا النقطة الحمراء، نبحث عن حواف الجسم
-            if (crosshair.x != -1) {
-                cv::Mat edges;
-                cv::Canny(grayFrame, edges, 50, 150);
-                cv::Mat maskedEdges;
-                cv::bitwise_and(edges, edges, maskedEdges, circleMask); 
+                    cv::Mat circleMask = cv::Mat::zeros(roiFrame.size(), CV_8UC1);
+                    cv::circle(circleMask, cv::Point(cx, cy), g_circleRadius, cv::Scalar(255), -1);
+                    cv::bitwise_and(colorThreshold, circleMask, colorThreshold);
 
-                std::vector<std::vector<cv::Point>> contours;
-                cv::findContours(maskedEdges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+                    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+                    cv::morphologyEx(colorThreshold, colorThreshold, cv::MORPH_CLOSE, kernel);
 
-                for (const auto& cnt : contours) {
-                    cv::Rect rect = cv::boundingRect(cnt);
-                    // نبحث عن شكل طولي (طوله أكبر من عرضه) ويحتوي على المؤشر
-                    if (rect.height > rect.width * 1.2 && rect.height > 20) {
-                        if (rect.contains(crosshair)) {
-                            headY = rect.y; // أعلى نقطة في الشكل (الرأس)
-                            foundHead = true;
-                            break; 
+                    std::vector<std::vector<cv::Point>> contours;
+                    cv::findContours(colorThreshold, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+                    for (const auto& cnt : contours) {
+                        double area = cv::contourArea(cnt);
+                        if (area > 100) { 
+                            cv::Rect rect = cv::boundingRect(cnt);
+                            
+                            // 3. شرط الطول > العرض (للتأكد أنه إنسان)
+                            if (rect.height > rect.width * 1.2) {
+                                // هل هذا الجسم يمر عبر المنتصف؟
+                                if (rect.contains(cv::Point(cx, cy))) {
+                                    detectedBox = rect;
+                                    highestY = rect.y; 
+                                    foundBody = true;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            if (foundHead && g_isAltPressed) {
-                if (!g_isHeadFound) { 
-                    std::cout << "[+] Head Locked! Firing...\n";
-                    g_isHeadFound = true;
+            // 4. تحديث الرسم (نرسم المربع حول الجسم، وليس حول المؤشر)
+            {
+                std::lock_guard<std::mutex> lock(g_boxMutex);
+                if (foundBody) {
+                    g_targetBox = detectedBox;
+                    g_hasTarget = true;
+                } else {
+                    g_hasTarget = false;
                 }
+            }
+            
+            if (overlayHwnd) InvalidateRect(overlayHwnd, NULL, TRUE);
 
-                int screenCenterX = GetSystemMetrics(SM_CXSCREEN) / 2;
-                int screenCenterY = GetSystemMetrics(SM_CYSCREEN) / 2;
-
-                int targetX = (screenCenterX - g_circleRadius) + crosshair.x;
-                int targetY = (screenCenterY - g_circleRadius) + headY;
-
-                int deltaX = targetX - screenCenterX;
-                int deltaY = targetY - screenCenterY;
-
-                if (std::abs(deltaX) > 2 || std::abs(deltaY) > 2) {
-                    SnapToTarget(deltaX, deltaY);
+            // 5. التصويب
+            if (foundBody && g_isAltPressed) {
+                int targetY = highestY + g_headOffset;
+                int deltaY = targetY - cy;
+                
+                if (std::abs(deltaY) > 2) {
+                    SnapToTarget(0, deltaY);
                 }
-                SetFireState(true); 
+                SetFireState(true);
             } else {
-                if (g_isHeadFound) {
-                    std::cout << "[-] Target Lost or ALT Released.\n";
-                    g_isHeadFound = false;
-                }
-                SetFireState(false); 
+                SetFireState(false);
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
