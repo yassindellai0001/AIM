@@ -3,194 +3,252 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <opencv2/opencv.hpp>
-#include <opencv2/dnn.hpp>
 #include <iostream>
-#include <cmath>
-#include <random>
 #include <chrono>
 #include <thread>
+#include <cmath>
+#include <random>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "gdi32.lib")
 
-// ================= الإعدادات =================
-const int FOV = 320;                   // نطاق البحث (سيتم التقاط 640x640 بكسل من المركز)
-const int TRIGGER_KEY = VK_MENU;       // زر ALT للتفعيل
-const float ASSIST_RADIUS = 300.0f;    // نطاق المساعدة (البكسل)
-const float PREDICT_TIME = 0.04f;      // التنبؤ بالحركة
-// ============================================
+// ================= المتغيرات العامة =================
+int g_circleRadius = 40; // نصف قطر الدائرة (قابل للتغيير من الكيبورد)
+const int TRIGGER_KEY = VK_MENU; // ALT
+// =====================================================
 
-class DXGICapture {
-public:
+// =====================================================================
+// محرك الالتقاط (DXGI)
+// =====================================================================
+class DXGICaptureEngine {
+private:
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
     IDXGIOutputDuplication* deskDupl = nullptr;
-    ID3D11Texture2D* acquiredDesktopImage = nullptr;
+    ID3D11Texture2D* stagingTex = nullptr;
+    int texWidth = 0;
+    int texHeight = 0;
 
+public:
     bool Init() {
         D3D_FEATURE_LEVEL featureLevel;
-        D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device, &featureLevel, &context);
+        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device, &featureLevel, &context);
+        if (FAILED(hr)) return false;
+
         IDXGIDevice* dxgiDevice = nullptr; device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
         IDXGIAdapter* dxgiAdapter = nullptr; dxgiDevice->GetParent(__uuidof(IDXGIAdapter), (void**)&dxgiAdapter);
         IDXGIOutput* dxgiOutput = nullptr; dxgiAdapter->EnumOutputs(0, &dxgiOutput);
         IDXGIOutput1* dxgiOutput1 = nullptr; dxgiOutput->QueryInterface(__uuidof(IDXGIOutput1), (void**)&dxgiOutput1);
-        HRESULT hr = dxgiOutput1->DuplicateOutput(device, &deskDupl);
+
+        hr = dxgiOutput1->DuplicateOutput(device, &deskDupl);
         dxgiOutput1->Release(); dxgiOutput->Release(); dxgiAdapter->Release(); dxgiDevice->Release();
         return SUCCEEDED(hr);
     }
 
-    bool GetFrame(cv::Mat& outMat) {
+    int GrabFrame(cv::Mat& outFrame) {
+        if (!deskDupl) return -1;
         DXGI_OUTDUPL_FRAME_INFO frameInfo; IDXGIResource* desktopResource = nullptr;
         HRESULT hr = deskDupl->AcquireNextFrame(0, &frameInfo, &desktopResource);
-        if (hr == DXGI_ERROR_WAIT_TIMEOUT || FAILED(hr)) return false;
+        
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) return 0; 
+        if (hr == DXGI_ERROR_ACCESS_LOST) return -1; 
+        if (FAILED(hr)) return -1;
+
+        ID3D11Texture2D* acquiredDesktopImage = nullptr;
         desktopResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&acquiredDesktopImage);
         D3D11_TEXTURE2D_DESC desc; acquiredDesktopImage->GetDesc(&desc);
-        ID3D11Texture2D* stagingTex = nullptr;
-        desc.Usage = D3D11_USAGE_STAGING; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ; desc.BindFlags = 0; desc.MiscFlags = 0;
-        device->CreateTexture2D(&desc, nullptr, &stagingTex);
-        context->CopyResource(stagingTex, acquiredDesktopImage);
-        D3D11_MAPPED_SUBRESOURCE mapped; context->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
-        cv::Mat frame(desc.Height, desc.Width, CV_8UC4, mapped.pData, mapped.RowPitch);
-        
-        int centerX = desc.Width / 2; int centerY = desc.Height / 2;
-        cv::Rect roi(centerX - FOV, centerY - FOV, FOV * 2, FOV * 2);
-        if (roi.x >= 0 && roi.y >= 0 && roi.x + roi.width <= desc.Width && roi.y + roi.height <= desc.Height) 
-            outMat = frame(roi).clone();
 
-        context->Unmap(stagingTex, 0); stagingTex->Release(); acquiredDesktopImage->Release(); deskDupl->ReleaseFrame();
-        return true;
+        if (!stagingTex || texWidth != desc.Width || texHeight != desc.Height) {
+            if (stagingTex) stagingTex->Release();
+            desc.Usage = D3D11_USAGE_STAGING; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ; desc.BindFlags = 0; desc.MiscFlags = 0;
+            device->CreateTexture2D(&desc, nullptr, &stagingTex);
+            texWidth = desc.Width; texHeight = desc.Height;
+        }
+
+        context->CopyResource(stagingTex, acquiredDesktopImage);
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        hr = context->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
+        
+        if (SUCCEEDED(hr)) {
+            cv::Mat fullFrame(desc.Height, desc.Width, CV_8UC4, mapped.pData, mapped.RowPitch);
+            int centerX = desc.Width / 2; int centerY = desc.Height / 2;
+            
+            // نأخذ مربعاً أكبر قليلاً من الدائرة لضمان قراءة حوافها
+            int FOV = g_circleRadius + 10; 
+            cv::Rect roi(centerX - FOV, centerY - FOV, FOV * 2, FOV * 2);
+            
+            if (roi.x >= 0 && roi.y >= 0 && roi.x + roi.width <= desc.Width && roi.y + roi.height <= desc.Height) {
+                outFrame = fullFrame(roi).clone();
+            }
+            context->Unmap(stagingTex, 0);
+        }
+        acquiredDesktopImage->Release(); deskDupl->ReleaseFrame();
+        return 1;
+    }
+
+    void Release() {
+        if (stagingTex) stagingTex->Release(); if (deskDupl) deskDupl->Release();
+        if (context) context->Release(); if (device) device->Release();
     }
 };
 
-void HumanizedMove(int targetX, int targetY) {
-    POINT currentPos; GetCursorPos(&currentPos);
-    float distance = std::hypot(targetX - currentPos.x, targetY - currentPos.y);
-    if (distance < 3.0f) return;
+// =====================================================================
+// نافذة الرسم (الدائرة الخضراء الشفافة)
+// =====================================================================
+LRESULT CALLBACK OverlayProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        
+        // إعداد القلم الأخضر
+        HPEN hPen = CreatePen(PS_SOLID, 2, RGB(0, 255, 0));
+        HGDIOBJ oldPen = SelectObject(hdc, hPen);
+        HBRUSH hBrush = (HBRUSH)GetStockObject(NULL_BRUSH); // شفاف من الداخل
+        HGDIOBJ oldBrush = SelectObject(hdc, hBrush);
 
-    std::random_device rd; std::mt19937 gen(rd());
-    std::uniform_int_distribution<> stepsDist(10, 15);
-    std::uniform_int_distribution<> jitterDist(-2, 2);
-    
-    int steps = stepsDist(gen);
-    int overshootX = targetX + (rand() % 6 - 3);
-    int overshootY = targetY + (rand() % 6 - 3);
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
+        int cx = screenW / 2;
+        int cy = screenH / 2;
+
+        // رسم الدائرة في المنتصف
+        Ellipse(hdc, cx - g_circleRadius, cy - g_circleRadius, cx + g_circleRadius, cy + g_circleRadius);
+
+        SelectObject(hdc, oldPen); SelectObject(hdc, oldBrush);
+        DeleteObject(hPen);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+void StartOverlay() {
+    WNDCLASS wc = { 0 };
+    wc.lpfnWndProc = OverlayProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = "AimbotOverlay";
+    RegisterClass(&wc);
+
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+
+    HWND hwnd = CreateWindowEx(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        "AimbotOverlay", "Overlay", WS_POPUP,
+        0, 0, screenW, screenH, NULL, NULL, wc.hInstance, NULL
+    );
+
+    SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0, LWA_COLORKEY); // جعل الخلفية شفافة
+    ShowWindow(hwnd, SW_SHOW);
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+}
+
+// =====================================================================
+// التصويب والإطلاق
+// =====================================================================
+void SnapToHead(int yOffset) {
+    POINT currentPos; GetCursorPos(&currentPos);
+    int steps = 3 + (rand() % 3);
+    int targetY = currentPos.y - yOffset;
 
     for (int i = 1; i <= steps; ++i) {
-        float t = (float)i / steps; 
-        float easeT = t * t * (3.0f - 2.0f * t); 
-        
-        int nextX = currentPos.x + (int)((overshootX - currentPos.x) * easeT);
-        int nextY = currentPos.y + (int)((overshootY - currentPos.y) * easeT);
-
-        if (i == steps) { nextX += jitterDist(gen); nextY += jitterDist(gen); }
-
+        float t = (float)i / steps;
+        int nextY = currentPos.y + (int)((targetY - currentPos.y) * t);
         INPUT input = { 0 }; input.type = INPUT_MOUSE;
-        input.mi.dx = nextX - currentPos.x; input.mi.dy = nextY - currentPos.y; 
-        input.mi.dwFlags = MOUSEEVENTF_MOVE;
+        input.mi.dy = nextY - currentPos.y; input.mi.dwFlags = MOUSEEVENTF_MOVE;
         SendInput(1, &input, sizeof(INPUT));
         std::this_thread::sleep_for(std::chrono::microseconds(300));
     }
 }
 
+void FireWeapon() {
+    INPUT click = { 0 }; click.type = INPUT_MOUSE; click.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    SendInput(1, &click, sizeof(INPUT));
+    std::this_thread::sleep_for(std::chrono::milliseconds(25)); 
+    click.mi.dwFlags = MOUSEEVENTF_LEFTUP; SendInput(1, &click, sizeof(INPUT));
+}
+
+// =====================================================================
+// الدالة الرئيسية
+// =====================================================================
 int main() {
-    std::cout << "[+] Loading AI Model (YOLOv8)...\n";
-    cv::dnn::Net net = cv::dnn::readNetFromONNX("yolov8n.onnx");
-    net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-    net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU); // معالج لضمان الاستقرار
+    std::cout << "[+] Starting Circular Triggerbot...\n";
+    
+    // تشغيل نافذة الدائرة في خيط منفصل
+    std::thread overlayThread(StartOverlay);
+    overlayThread.detach();
+    
+    DXGICaptureEngine capture;
+    cv::Mat roiFrame;
+    auto lastShotTime = std::chrono::high_resolution_clock::now();
 
-    DXGICapture capture;
-    if (!capture.Init()) { std::cout << "[-] DXGI Failed. Make sure BlueStacks is Windowed.\n"; return 1; }
-
-    cv::Mat frame;
-    float lastTargetX = -1, lastTargetY = -1;
-    auto lastTime = std::chrono::high_resolution_clock::now();
-    int noTargetCounter = 0;
-
-    std::cout << "[+] Aimbot Running. Hold [ALT] to aim.\n\n";
+    while (!capture.Init()) {
+        std::cout << "[-] DXGI Init Failed. Retrying...\n";
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+    std::cout << "[+] Engine Initialized. Hold [ALT] to trigger.\n";
+    std::cout << "[+] Press [+] or [-] to resize the circle.\n";
 
     while (true) {
-        if (!capture.GetFrame(frame)) continue;
+        // قراءة أزرار التحكم بحجم الدائرة
+        if (GetAsyncKeyState(VK_ADD) & 0x8000 || GetAsyncKeyState(VK_OEM_PLUS) & 0x8000) {
+            g_circleRadius += 2;
+            if (g_circleRadius > 300) g_circleRadius = 300;
+            InvalidateRect(FindWindow("AimbotOverlay", NULL), NULL, TRUE); // إعادة رسم الدائرة
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (GetAsyncKeyState(VK_SUBTRACT) & 0x8000 || GetAsyncKeyState(VK_OEM_MINUS) & 0x8000) {
+            g_circleRadius -= 2;
+            if (g_circleRadius < 10) g_circleRadius = 10;
+            InvalidateRect(FindWindow("AimbotOverlay", NULL), NULL, TRUE);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
 
-        cv::Mat rgbFrame; cv::cvtColor(frame, rgbFrame, cv::COLOR_BGRA2RGB);
-        cv::Mat blob; cv::dnn::blobFromImage(rgbFrame, blob, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true, false);
-        net.setInput(blob);
-        std::vector<cv::Mat> outputs; net.forward(outputs, net.getUnconnectedOutLayersNames());
+        int status = capture.GrabFrame(roiFrame);
+        if (status == -1) {
+            capture.Release(); std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            while (!capture.Init()) { std::this_thread::sleep_for(std::chrono::seconds(1)); }
+            continue;
+        }
+        if (status == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
 
-        float* data = (float*)outputs[0].data;
-        int dimensions = outputs[0].size[1]; 
-        int rows = outputs[0].size[2];       
-        float minDist = FLT_MAX; cv::Point bestTarget(-1, -1);
-        float bestConf = 0.0f;
+        if (status == 1 && !roiFrame.empty()) {
+            cv::Mat hsvFrame;
+            cv::cvtColor(roiFrame, hsvFrame, cv::COLOR_BGRA2BGR);
+            cv::cvtColor(hsvFrame, hsvFrame, cv::COLOR_BGR2HSV);
 
-        for (int i = 0; i < rows; ++i) {
-            float* rowData = data + i * dimensions;
-            float confidence = rowData[4]; 
+            // إنشاء قناع دائري (Circular Mask)
+            cv::Mat mask = cv::Mat::zeros(roiFrame.size(), CV_8UC1);
+            cv::circle(mask, cv::Point(roiFrame.cols / 2, roiFrame.rows / 2), g_circleRadius, cv::Scalar(255), -1);
+
+            // فلترة اللون الأحمر
+            cv::Mat mask1, mask2, redMask, finalMask;
+            cv::inRange(hsvFrame, cv::Scalar(0, 120, 100), cv::Scalar(10, 255, 255), mask1);
+            cv::inRange(hsvFrame, cv::Scalar(170, 120, 100), cv::Scalar(180, 255, 255), mask2);
+            cv::bitwise_or(mask1, mask2, redMask);
+
+            // دمج قناع اللون الأحمر مع القناع الدائري (نتجاهل أي شيء خارج الدائرة)
+            cv::bitwise_and(redMask, mask, finalMask);
+
+            double redPixelCount = cv::countNonZero(finalMask);
             
-            // نسبة الثقة 25% لاكتشاف اللاعبين
-            if (confidence > 0.25) { 
-                int cx = (int)(rowData[0] * frame.cols);
-                int cy = (int)(rowData[1] * frame.rows);
-                int w = (int)(rowData[2] * frame.cols);
-                int h = (int)(rowData[3] * frame.rows);
-                int topY = cy - h / 2; 
+            // إذا وجدنا بكسلات حمراء داخل الدائرة، وكان زر ALT مضغوطاً
+            if (redPixelCount >= 10 && (GetAsyncKeyState(TRIGGER_KEY) & 0x8000)) {
+                auto currentTime = std::chrono::high_resolution_clock::now();
+                float timeSinceLastShot = std::chrono::duration<float, std::milli>(currentTime - lastShotTime).count();
                 
-                float dist = std::hypot(cx - (frame.cols / 2), topY - (frame.rows / 2));
-                
-                // إذا كان الهدف داخل نطاق المساعدة، اختره
-                if (dist < minDist && dist < ASSIST_RADIUS) { 
-                    minDist = dist; 
-                    bestTarget = cv::Point(cx, topY); 
-                    bestConf = confidence;
+                if (timeSinceLastShot > 80.0f) {
+                    lastShotTime = currentTime;
+                    SnapToHead(15); 
+                    FireWeapon();
                 }
             }
-        }
-
-        // === ميزة التشخيص (الطباعة في الشاشة السوداء) ===
-        if (bestTarget.x != -1) {
-            std::cout << "[+] Target Found! Confidence: " << bestConf << " | Distance: " << minDist << std::endl;
-            noTargetCounter = 0;
-        } else {
-            noTargetCounter++;
-            if (noTargetCounter > 100) { // لتجنب إغراق الشاشة
-                std::cout << "[-] Scanning... No targets in range.\n";
-                noTargetCounter = 0;
-            }
-        }
-
-        // التحرك والإطلاق (فقط عند الضغط على ALT)
-        if ((GetAsyncKeyState(TRIGGER_KEY) & 0x8000) && bestTarget.x != -1) {
-            auto currentTime = std::chrono::high_resolution_clock::now();
-            float deltaTime = std::chrono::duration<float>(currentTime - lastTime).count();
-            
-            float aimX = bestTarget.x;
-            float aimY = bestTarget.y;
-
-            if (lastTargetX != -1 && deltaTime > 0.01f && deltaTime < 0.1f) {
-                float velX = (bestTarget.x - lastTargetX) / deltaTime;
-                float velY = (bestTarget.y - lastTargetY) / deltaTime;
-                aimX += velX * PREDICT_TIME;
-                aimY += velY * PREDICT_TIME;
-            }
-
-            lastTargetX = bestTarget.x; lastTargetY = bestTarget.y; lastTime = currentTime;
-
-            int actualX = aimX + (GetSystemMetrics(SM_CXSCREEN) / 2) - FOV;
-            int actualY = aimY + (GetSystemMetrics(SM_CYSCREEN) / 2) - FOV;
-
-            HumanizedMove(actualX, actualY);
-
-            if (minDist < 25.0f) { // إذا كان التصويب قريباً جداً من الهدف
-                int reactionDelay = 20 + (rand() % 30);
-                std::this_thread::sleep_for(std::chrono::milliseconds(reactionDelay));
-                
-                INPUT click = { 0 }; click.type = INPUT_MOUSE; click.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-                SendInput(1, &click, sizeof(INPUT));
-                std::this_thread::sleep_for(std::chrono::milliseconds(30)); 
-                click.mi.dwFlags = MOUSEEVENTF_LEFTUP; SendInput(1, &click, sizeof(INPUT));
-                std::this_thread::sleep_for(std::chrono::milliseconds(60)); 
-            }
-        } else {
-            lastTargetX = -1;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
