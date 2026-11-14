@@ -1,5 +1,5 @@
 // language: C++, file: main.cpp, runtime: MSVC v143 (C++17), Windows 10/11
-// v72 - Complete: Circle FOV + Yellow Box, Shape Filter, Sub-Pixel, No-Sleep, Jitter
+// v73 - Fixed Color Conversion (RGBA->BGR->HSV), Fixed C4244 Warnings, Full Overlay
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -351,7 +351,7 @@ BOOL WINAPI ConsoleHandler(DWORD sig) {
 // =====================================================================
 int main() {
     SetProcessDPIAware(); SetConsoleCtrlHandler(ConsoleHandler, TRUE);
-    LogInfo("Modark Head-Aimbot v72 (Circle + Yellow Box)");
+    LogInfo("Modark Head-Aimbot v73 (Fixed Color Conversion)");
 
     Config cfg = LoadConfig("aimbot.ini");
     g_circleRadius.store(cfg.circleRadius); g_aimSpeed.store(cfg.aimSpeed);
@@ -378,7 +378,8 @@ int main() {
     auto targetAcquiredTime = Clock::now();
     bool wasTargetDetected = false; int currentHumanDelay = 30;
 
-    cv::Mat hsv, circleMask, m1, m2, redMask, finalRed;
+    // Pre-allocated resources + Added 'bgr' Mat
+    cv::Mat hsv, bgr, circleMask, m1, m2, redMask, finalRed;
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
     std::vector<std::vector<cv::Point>> redContours;
     int lastMaskRadius = -1;
@@ -387,8 +388,10 @@ int main() {
 
     auto processor = [&](cv::Mat& mappedMat, bool isRGBA, int realCx, int realCy) {
         
-        if (isRGBA) cv::cvtColor(mappedMat, hsv, cv::COLOR_RGBA2HSV);
-        else        cv::cvtColor(mappedMat, hsv, cv::COLOR_BGRA2HSV);
+        // FIX: Convert RGBA/BGRA to BGR first, then BGR to HSV
+        if (isRGBA) cv::cvtColor(mappedMat, bgr, cv::COLOR_RGBA2BGR);
+        else        cv::cvtColor(mappedMat, bgr, cv::COLOR_BGRA2BGR);
+        cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
 
         int radius = g_circleRadius.load();
 
@@ -416,7 +419,7 @@ int main() {
             if (cv::contourArea(c) >= minArea) {
                 cv::Rect rect = cv::boundingRect(c);
                 
-                // Aspect Ratio Filter (Ignore boxes/lines, only human-like shapes)
+                // Aspect Ratio Filter
                 float aspect = (float)rect.height / (float)rect.width;
                 if (aspect < 1.4f || aspect > 2.8f) continue;
 
@@ -429,7 +432,7 @@ int main() {
         auto now = Clock::now();
         if (redDetected) lastRedSeen = now;
 
-        long sinceRed = duration_cast<milliseconds>(now - lastRedSeen).count();
+        auto sinceRed = duration_cast<milliseconds>(now - lastRedSeen).count();
         bool shouldFire = g_isAltPressed.load() && (redDetected || sinceRed < cfg.fireGraceMs);
 
         if (redDetected) {
@@ -438,7 +441,6 @@ int main() {
 
         if (shouldFire && redDetected) {
             
-            // Random Head Jitter (Prevents perfect robotic aim)
             int jitterX = jitterDist(rng);
             int jitterY = jitterDist(rng);
             
@@ -471,14 +473,14 @@ int main() {
                 }
             }
 
-            long timeSinceAcquired = duration_cast<milliseconds>(now - targetAcquiredTime).count();
+            auto timeSinceAcquired = duration_cast<milliseconds>(now - targetAcquiredTime).count();
             if (timeSinceAcquired >= currentHumanDelay) {
                 bool wasFiring = g_isFiring.load(); SetFireState(true);
                 if (!wasFiring) lastLiftTime = now - milliseconds(g_liftIntervalMs.load());
 
                 if (duration_cast<milliseconds>(now - lastLiftTime).count() >= g_liftIntervalMs.load()) {
                     int baseLift = g_liftValue.load();
-                    long firingDuration = duration_cast<milliseconds>(now - targetAcquiredTime).count();
+                    auto firingDuration = duration_cast<milliseconds>(now - targetAcquiredTime).count();
                     int currentLift = baseLift;
                     
                     if (firingDuration > 300) currentLift = std::max(0, baseLift - 1);
@@ -497,7 +499,7 @@ int main() {
         }
 
         frameCount++;
-        long sinceFps = duration_cast<milliseconds>(now - lastFpsTick).count();
+        auto sinceFps = duration_cast<milliseconds>(now - lastFpsTick).count();
         if (sinceFps >= 500) { g_fps.store(frameCount * 1000.0f / sinceFps); frameCount = 0; lastFpsTick = now; }
 
         {
@@ -505,7 +507,6 @@ int main() {
             g_status.red = redDetected; g_status.alt = g_isAltPressed.load(); g_status.firing = g_isFiring.load();
             g_status.radius = radius; g_status.lift = g_liftValue.load(); g_status.aimSpd = g_aimSpeed.load(); g_status.fps = g_fps.load();
             
-            // Update Box Coordinates for Overlay
             if (redDetected) {
                 g_status.boxX = bestRect.x;
                 g_status.boxY = bestRect.y;
