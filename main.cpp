@@ -1,5 +1,5 @@
 // language: C++, file: main.cpp, runtime: MSVC v143 (C++17), Windows 10/11
-// v73 - Fixed Color Conversion (RGBA->BGR->HSV), Fixed C4244 Warnings, Full Overlay
+// v77 - Red (Strict) + Motion (For drawing/firing). Shape is optional. Masked inside Green Circle.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -33,32 +33,16 @@ using std::chrono::milliseconds;
 using std::chrono::duration_cast;
 
 // =====================================================================
-//  LOGGING
-// =====================================================================
-static void LogInfo(const std::string& msg) {
-    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), FOREGROUND_GREEN | FOREGROUND_INTENSITY);
-    std::cout << "[INFO] " << msg << "\n";
-    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
-}
-static void LogError(const std::string& msg, HRESULT hr = S_OK) {
-    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), FOREGROUND_RED | FOREGROUND_INTENSITY);
-    std::cout << "[ERROR] " << msg;
-    if (hr != S_OK) std::cout << " (HRESULT: 0x" << std::hex << hr << std::dec << ")";
-    std::cout << "\n";
-    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
-}
-
-// =====================================================================
 //  CONFIG & GLOBALS
 // =====================================================================
 struct Config {
     int circleRadius   = 150;
-    float aimSpeed     = 0.70f;
+    float aimSpeed     = 0.60f;
     int headOffset     = 0;
     int liftValue      = 3;
     int liftIntervalMs = 30;
-    int fireGraceMs    = 80;
-    int minRedArea     = 10;
+    int minRedArea     = 15;
+    int minMotionPixels= 15;   // Number of pixels that must change to consider it "moving"
 };
 
 static Config LoadConfig(const char* path) {
@@ -77,8 +61,8 @@ static Config LoadConfig(const char* path) {
             else if (k == "headOffset")     c.headOffset     = std::stoi(v);
             else if (k == "liftValue")      c.liftValue      = std::stoi(v);
             else if (k == "liftIntervalMs") c.liftIntervalMs = std::stoi(v);
-            else if (k == "fireGraceMs")    c.fireGraceMs    = std::stoi(v);
             else if (k == "minRedArea")     c.minRedArea     = std::stoi(v);
+            else if (k == "minMotionPixels")c.minMotionPixels= std::stoi(v);
         } catch (...) {}
     }
     return c;
@@ -86,15 +70,16 @@ static Config LoadConfig(const char* path) {
 
 static std::atomic<bool>  g_appRunning(true);
 static std::atomic<int>   g_circleRadius(150);
-static std::atomic<float> g_aimSpeed(0.70f);
+static std::atomic<float> g_aimSpeed(0.60f);
 static std::atomic<int>   g_headOffset(0);
 static std::atomic<int>   g_liftValue(3);
 static std::atomic<int>   g_liftIntervalMs(30);
-static std::atomic<int>   g_minRedArea(10);
+static std::atomic<int>   g_minRedArea(15);
+static std::atomic<int>   g_minMotionPixels(15);
 
 static std::atomic<bool>  g_isFiring(false);
 static std::atomic<bool>  g_isAltPressed(false);
-static std::atomic<bool>  g_redVisible(false);
+static std::atomic<bool>  g_targetVisible(false);
 static std::atomic<DWORD> g_overlayThreadId(0);
 static std::atomic<HWND>  g_overlayHwnd(nullptr);
 static std::atomic<int>   g_overlayState(0);
@@ -105,15 +90,14 @@ static const int TRIGGER_KEY = VK_MENU;
 struct OverlayStatus {
     bool  red = false, alt = false, firing = false;
     int   radius = 150, lift = 3;
-    float aimSpd = 0.70f, fps = 0.0f;
-    // Yellow Box Coordinates
+    float aimSpd = 0.60f, fps = 0.0f;
     int   boxX = 0, boxY = 0, boxW = 0, boxH = 0;
 };
 static std::mutex    g_statusMutex;
 static OverlayStatus g_status;
 
 // =====================================================================
-//  CAPTURE ENGINE
+//  CAPTURE ENGINE (Unchanged)
 // =====================================================================
 enum class CaptureStatus { Success, Timeout, AccessLost, DeviceLost, Error, InvalidROI };
 
@@ -149,7 +133,7 @@ public:
         Cleanup();
         D3D_FEATURE_LEVEL fl;
         HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, device.GetAddressOf(), &fl, context.GetAddressOf());
-        if (FAILED(hr)) { LogError("D3D11CreateDevice failed", hr); return false; }
+        if (FAILED(hr)) return false;
 
         ComPtr<IDXGIDevice> dxgiDevice; hr = device.As(&dxgiDevice); if (FAILED(hr)) return false;
         ComPtr<IDXGIAdapter> dxgiAdapter; hr = dxgiDevice->GetParent(__uuidof(IDXGIAdapter), (void**)dxgiAdapter.GetAddressOf()); if (FAILED(hr)) return false;
@@ -158,7 +142,6 @@ public:
 
         hr = dxgiOutput1->DuplicateOutput(device.Get(), deskDupl.GetAddressOf());
         if (SUCCEEDED(hr)) { initialized = true; return true; }
-        LogError("DuplicateOutput failed", hr);
         return false;
     }
 
@@ -172,7 +155,7 @@ public:
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) return CaptureStatus::Timeout;
         if (hr == DXGI_ERROR_ACCESS_LOST)  return CaptureStatus::AccessLost;
         if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) return CaptureStatus::DeviceLost;
-        if (FAILED(hr)) { LogError("AcquireNextFrame failed", hr); return CaptureStatus::Error; }
+        if (FAILED(hr)) return CaptureStatus::Error;
 
         DXGIFrameLocker frameLock(deskDupl.Get());
 
@@ -185,7 +168,7 @@ public:
 
         if      (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM) isRGBA = true;
         else if (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM) isRGBA = false;
-        else { LogError("Unsupported DXGI_FORMAT"); return CaptureStatus::Error; }
+        else return CaptureStatus::Error;
 
         int cx = desc.Width / 2;
         int cy = desc.Height / 2;
@@ -218,10 +201,7 @@ public:
 
         D3D11_MAPPED_SUBRESOURCE mapped = {};
         hr = context->Map(stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-        if (FAILED(hr)) {
-            if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) return CaptureStatus::DeviceLost;
-            return CaptureStatus::Error;
-        }
+        if (FAILED(hr)) return CaptureStatus::Error;
 
         {
             DXGIMapLocker mapLock(context.Get(), stagingTex.Get());
@@ -267,7 +247,6 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         OverlayStatus s; { std::lock_guard<std::mutex> lk(g_statusMutex); s = g_status; }
         int cx = GetSystemMetrics(SM_CXSCREEN) / 2, cy = GetSystemMetrics(SM_CYSCREEN) / 2, r = s.radius;
 
-        // Draw FOV Circle
         COLORREF color = s.firing ? RGB(255, 60, 60) : s.red ? RGB(255, 220, 0) : RGB(0, 255, 0);
         HPEN pen = CreatePen(PS_SOLID, 2, color);
         HGDIOBJ oldPen = SelectObject(hdc, pen);
@@ -275,31 +254,25 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
         SelectObject(hdc, oldPen); SelectObject(hdc, oldBrush); DeleteObject(pen);
 
-        // Draw Yellow Box around detected target
         if (s.red && s.boxW > 0 && s.boxH > 0) {
-            int fov = r + 20; // Matches the crop size
+            int fov = r + 20;
             int screenStartX = cx - fov;
             int screenStartY = cy - fov;
-
             int drawX = screenStartX + s.boxX;
             int drawY = screenStartY + s.boxY;
 
-            HPEN boxPen = CreatePen(PS_SOLID, 2, RGB(255, 220, 0)); // Yellow
+            HPEN boxPen = CreatePen(PS_SOLID, 2, RGB(255, 220, 0));
             HGDIOBJ oldBoxPen = SelectObject(hdc, boxPen);
             HGDIOBJ oldBoxBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            
             Rectangle(hdc, drawX, drawY, drawX + s.boxW, drawY + s.boxH);
-            
             SelectObject(hdc, oldBoxPen); SelectObject(hdc, oldBoxBrush); DeleteObject(boxPen);
         }
 
-        // Draw Status Text
         char buf[256];
-        snprintf(buf, sizeof(buf), "FPS %.0f | R %d | LIFT %d | SPD %.2f | RED:%c ALT:%c FIRE:%c",
+        snprintf(buf, sizeof(buf), "FPS %.0f | R %d | LIFT %d | SPD %.2f | TARGET:%c ALT:%c FIRE:%c",
                  s.fps, s.radius, s.lift, s.aimSpd, s.red ? 'Y' : 'N', s.alt ? 'Y' : 'N', s.firing ? 'Y' : 'N');
         SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, color);
         TextOutA(hdc, 20, 20, buf, (int)strlen(buf));
-        
         EndPaint(hwnd, &ps); return 0;
     }
     if (msg == WM_TIMER) { InvalidateRect(hwnd, nullptr, FALSE); return 0; }
@@ -351,35 +324,35 @@ BOOL WINAPI ConsoleHandler(DWORD sig) {
 // =====================================================================
 int main() {
     SetProcessDPIAware(); SetConsoleCtrlHandler(ConsoleHandler, TRUE);
-    LogInfo("Modark Head-Aimbot v73 (Fixed Color Conversion)");
+    std::cout << "[+] Modark Aimbot v77 - Red + Motion (Inside Circle)\n";
 
     Config cfg = LoadConfig("aimbot.ini");
     g_circleRadius.store(cfg.circleRadius); g_aimSpeed.store(cfg.aimSpeed);
     g_headOffset.store(cfg.headOffset); g_liftValue.store(cfg.liftValue);
     g_liftIntervalMs.store(cfg.liftIntervalMs); g_minRedArea.store(cfg.minRedArea);
+    g_minMotionPixels.store(cfg.minMotionPixels);
 
     std::thread overlay(OverlayThread);
     while (g_overlayState.load() == 0) std::this_thread::sleep_for(milliseconds(10));
-    if (g_overlayState.load() == -1) { LogError("Overlay init failed."); return 1; }
+    if (g_overlayState.load() == -1) return 1;
 
     DXGICaptureEngine capture;
-    while (g_appRunning.load() && !capture.Init()) { LogInfo("Retrying D3D11..."); std::this_thread::sleep_for(std::chrono::seconds(1)); }
+    while (g_appRunning.load() && !capture.Init()) std::this_thread::sleep_for(std::chrono::seconds(1));
     if (!capture.IsInitialized()) { g_appRunning.store(false); if (overlay.joinable()) overlay.join(); return 1; }
 
     Hotkeys hk;
-    auto lastInputCheck = Clock::now(), lastFpsTick = Clock::now();
-    auto lastRedSeen = Clock::now() - milliseconds(1000), lastLiftTime = Clock::now();
+    auto lastInputCheck = Clock::now(), lastFpsTick = Clock::now(), lastLogTick = Clock::now();
+    auto lastTargetSeen = Clock::now() - milliseconds(1000), lastLiftTime = Clock::now();
     int frameCount = 0;
 
     std::mt19937 rng(std::random_device{}());
     std::uniform_int_distribution<int> delayDist(20, 50);
-    std::uniform_int_distribution<int> jitterDist(-2, 2);
+    std::uniform_int_distribution<int> jitterDist(-1, 1); 
     
     auto targetAcquiredTime = Clock::now();
     bool wasTargetDetected = false; int currentHumanDelay = 30;
 
-    // Pre-allocated resources + Added 'bgr' Mat
-    cv::Mat hsv, bgr, circleMask, m1, m2, redMask, finalRed;
+    cv::Mat hsv, bgr, gray, prevGray, diff, motionMask, circleMask, m1, m2, redMask, finalRed;
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
     std::vector<std::vector<cv::Point>> redContours;
     int lastMaskRadius = -1;
@@ -388,10 +361,10 @@ int main() {
 
     auto processor = [&](cv::Mat& mappedMat, bool isRGBA, int realCx, int realCy) {
         
-        // FIX: Convert RGBA/BGRA to BGR first, then BGR to HSV
         if (isRGBA) cv::cvtColor(mappedMat, bgr, cv::COLOR_RGBA2BGR);
         else        cv::cvtColor(mappedMat, bgr, cv::COLOR_BGRA2BGR);
         cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
+        cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
 
         int radius = g_circleRadius.load();
 
@@ -401,45 +374,82 @@ int main() {
             lastMaskRadius = radius;
         }
 
+        // 1. RED MASK (Strictly inside green circle)
         cv::inRange(hsv, cv::Scalar(0, 120, 100),   cv::Scalar(10, 255, 255), m1);
         cv::inRange(hsv, cv::Scalar(170, 120, 100), cv::Scalar(180, 255, 255), m2);
         cv::bitwise_or(m1, m2, redMask);
-        cv::bitwise_and(redMask, circleMask, finalRed);
+        cv::bitwise_and(redMask, circleMask, finalRed); // Restrict to circle
         cv::morphologyEx(finalRed, finalRed, cv::MORPH_OPEN, kernel);
 
-        redContours.clear();
+        // 2. MOTION MASK
+        if (prevGray.empty() || prevGray.size() != gray.size()) {
+            gray.copyTo(prevGray);
+            return; // Skip first frame
+        }
+        cv::absdiff(gray, prevGray, diff);
+        cv::threshold(diff, motionMask, 25, 255, cv::THRESH_BINARY);
+        gray.copyTo(prevGray);
+
         cv::findContours(finalRed, redContours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
-        bool redDetected = false;
-        int minArea = g_minRedArea.load();
+        bool targetFound = false;
         cv::Rect bestRect;
         double minDist = 999999;
+        std::string logReason = "No Red in Circle";
 
         for (auto& c : redContours) {
-            if (cv::contourArea(c) >= minArea) {
-                cv::Rect rect = cv::boundingRect(c);
-                
-                // Aspect Ratio Filter
-                float aspect = (float)rect.height / (float)rect.width;
-                if (aspect < 1.4f || aspect > 2.8f) continue;
+            if (cv::contourArea(c) < g_minRedArea.load()) continue;
+            
+            cv::Rect rect = cv::boundingRect(c);
+            
+            // Strictly check motion inside this red contour
+            cv::Mat contourMask = cv::Mat::zeros(redMask.size(), CV_8UC1);
+            cv::drawContours(contourMask, std::vector<std::vector<cv::Point>>{c}, -1, cv::Scalar(255), -1);
+            
+            cv::Mat intersection;
+            cv::bitwise_and(contourMask, motionMask, intersection);
+            int motionPixels = cv::countNonZero(intersection);
 
-                double dist = std::hypot((rect.x + rect.width / 2) - realCx, (rect.y + rect.height / 2) - realCy);
-                if (dist < minDist) { minDist = dist; bestRect = rect; redDetected = true; }
+            if (motionPixels < g_minMotionPixels.load()) {
+                logReason = "Red but Static";
+                continue; // Must be moving
+            }
+
+            // Shape is just a bonus for logging, not a blocker
+            float aspect = (float)rect.height / (float)rect.width;
+            bool isShape = (aspect >= 1.2f && aspect <= 4.5f);
+
+            double dist = std::hypot((rect.x + rect.width / 2) - realCx, (rect.y + rect.height / 2) - realCy);
+            if (dist < minDist) { 
+                minDist = dist; 
+                bestRect = rect; 
+                targetFound = true; 
+                logReason = isShape ? "Locked (Shape + Moving)" : "Locked (Moving, No Shape)";
             }
         }
 
-        g_redVisible.store(redDetected);
+        g_targetVisible.store(targetFound);
         auto now = Clock::now();
-        if (redDetected) lastRedSeen = now;
+        if (targetFound) lastTargetSeen = now;
 
-        auto sinceRed = duration_cast<milliseconds>(now - lastRedSeen).count();
-        bool shouldFire = g_isAltPressed.load() && (redDetected || sinceRed < cfg.fireGraceMs);
+        // Logging
+        if (duration_cast<milliseconds>(now - lastLogTick).count() > 500) {
+            if (targetFound) {
+                std::cout << "[DEBUG] " << logReason << " | Box: " << bestRect.width << "x" << bestRect.height << "\n";
+            } else {
+                std::cout << "[DEBUG] " << logReason << "\n";
+            }
+            lastLogTick = now;
+        }
 
-        if (redDetected) {
+        auto sinceTarget = duration_cast<milliseconds>(now - lastTargetSeen).count();
+        bool shouldFire = g_isAltPressed.load() && (targetFound || sinceTarget < 50);
+
+        if (targetFound) {
             if (!wasTargetDetected) { targetAcquiredTime = now; wasTargetDetected = true; currentHumanDelay = delayDist(rng); }
         } else wasTargetDetected = false;
 
-        if (shouldFire && redDetected) {
+        if (shouldFire && targetFound) {
             
             int jitterX = jitterDist(rng);
             int jitterY = jitterDist(rng);
@@ -504,21 +514,17 @@ int main() {
 
         {
             std::lock_guard<std::mutex> lk(g_statusMutex);
-            g_status.red = redDetected; g_status.alt = g_isAltPressed.load(); g_status.firing = g_isFiring.load();
+            g_status.red = targetFound; g_status.alt = g_isAltPressed.load(); g_status.firing = g_isFiring.load();
             g_status.radius = radius; g_status.lift = g_liftValue.load(); g_status.aimSpd = g_aimSpeed.load(); g_status.fps = g_fps.load();
             
-            if (redDetected) {
-                g_status.boxX = bestRect.x;
-                g_status.boxY = bestRect.y;
-                g_status.boxW = bestRect.width;
-                g_status.boxH = bestRect.height;
-            } else {
-                g_status.boxW = 0; g_status.boxH = 0;
-            }
+            if (targetFound) {
+                g_status.boxX = bestRect.x; g_status.boxY = bestRect.y;
+                g_status.boxW = bestRect.width; g_status.boxH = bestRect.height;
+            } else { g_status.boxW = 0; g_status.boxH = 0; }
         }
     };
 
-    LogInfo("Engine live. Hold ALT + red in circle to lock head & fire.");
+    std::cout << "[+] Engine live. Check console for Debug info.\n";
 
     while (g_appRunning.load()) {
         auto now = Clock::now();
@@ -541,21 +547,15 @@ int main() {
         CaptureStatus st = capture.GrabFrameAndProcess(radius, processor);
         
         if (st == CaptureStatus::AccessLost) {
-            LogInfo("Capture access lost. Re-initializing...");
             capture.Cleanup(); std::this_thread::sleep_for(milliseconds(500));
             while (g_appRunning.load() && !capture.Init()) std::this_thread::sleep_for(std::chrono::seconds(1));
         } 
         else if (st == CaptureStatus::DeviceLost) {
-            LogError("D3D11 Device Lost. Rebuilding...");
             capture.Cleanup(); std::this_thread::sleep_for(milliseconds(2000));
             while (g_appRunning.load() && !capture.Init()) std::this_thread::sleep_for(std::chrono::seconds(1));
-            LogInfo("Capture engine rebuilt.");
         }
-        else if (st == CaptureStatus::Success) {
-            std::this_thread::yield();
-        } else {
-            std::this_thread::sleep_for(milliseconds(2));
-        }
+        else if (st == CaptureStatus::Success) { std::this_thread::yield(); } 
+        else { std::this_thread::sleep_for(milliseconds(2)); }
     }
 
     g_appRunning.store(false); SetFireState(false);
