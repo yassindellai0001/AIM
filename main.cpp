@@ -1,5 +1,5 @@
 // language: C++, file: main.cpp, runtime: MSVC v143 (C++17), Windows 10/11
-// v77 - Red (Strict) + Motion (For drawing/firing). Shape is optional. Masked inside Green Circle.
+// v79 - YOLOv8 AI Integration + Advanced Debug Logging
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -8,6 +8,7 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <opencv2/opencv.hpp>
+#include <opencv2/dnn.hpp>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -33,16 +34,32 @@ using std::chrono::milliseconds;
 using std::chrono::duration_cast;
 
 // =====================================================================
+//  LOGGING
+// =====================================================================
+static void LogInfo(const std::string& msg) {
+    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+    std::cout << "[INFO] " << msg << "\n";
+    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+}
+static void LogError(const std::string& msg, HRESULT hr = S_OK) {
+    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), FOREGROUND_RED | FOREGROUND_INTENSITY);
+    std::cout << "[ERROR] " << msg;
+    if (hr != S_OK) std::cout << " (HRESULT: 0x" << std::hex << hr << std::dec << ")";
+    std::cout << "\n";
+    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+}
+
+// =====================================================================
 //  CONFIG & GLOBALS
 // =====================================================================
 struct Config {
     int circleRadius   = 150;
-    float aimSpeed     = 0.60f;
+    float aimSpeed     = 0.65f;
     int headOffset     = 0;
     int liftValue      = 3;
     int liftIntervalMs = 30;
-    int minRedArea     = 15;
-    int minMotionPixels= 15;   // Number of pixels that must change to consider it "moving"
+    float confThreshold= 0.40f; // AI Confidence threshold (0.0 to 1.0)
+    float nmsThreshold = 0.45f;
 };
 
 static Config LoadConfig(const char* path) {
@@ -61,8 +78,8 @@ static Config LoadConfig(const char* path) {
             else if (k == "headOffset")     c.headOffset     = std::stoi(v);
             else if (k == "liftValue")      c.liftValue      = std::stoi(v);
             else if (k == "liftIntervalMs") c.liftIntervalMs = std::stoi(v);
-            else if (k == "minRedArea")     c.minRedArea     = std::stoi(v);
-            else if (k == "minMotionPixels")c.minMotionPixels= std::stoi(v);
+            else if (k == "confThreshold")  c.confThreshold  = std::stof(v);
+            else if (k == "nmsThreshold")   c.nmsThreshold   = std::stof(v);
         } catch (...) {}
     }
     return c;
@@ -70,12 +87,12 @@ static Config LoadConfig(const char* path) {
 
 static std::atomic<bool>  g_appRunning(true);
 static std::atomic<int>   g_circleRadius(150);
-static std::atomic<float> g_aimSpeed(0.60f);
+static std::atomic<float> g_aimSpeed(0.65f);
 static std::atomic<int>   g_headOffset(0);
 static std::atomic<int>   g_liftValue(3);
 static std::atomic<int>   g_liftIntervalMs(30);
-static std::atomic<int>   g_minRedArea(15);
-static std::atomic<int>   g_minMotionPixels(15);
+static std::atomic<float> g_confThreshold(0.40f);
+static std::atomic<float> g_nmsThreshold(0.45f);
 
 static std::atomic<bool>  g_isFiring(false);
 static std::atomic<bool>  g_isAltPressed(false);
@@ -90,14 +107,98 @@ static const int TRIGGER_KEY = VK_MENU;
 struct OverlayStatus {
     bool  red = false, alt = false, firing = false;
     int   radius = 150, lift = 3;
-    float aimSpd = 0.60f, fps = 0.0f;
+    float aimSpd = 0.65f, fps = 0.0f;
     int   boxX = 0, boxY = 0, boxW = 0, boxH = 0;
+    float confidence = 0.0f;
 };
 static std::mutex    g_statusMutex;
 static OverlayStatus g_status;
 
 // =====================================================================
-//  CAPTURE ENGINE (Unchanged)
+//  AI ENGINE (YOLOv8)
+// =====================================================================
+struct AIDetection {
+    cv::Rect box;
+    float confidence;
+};
+
+class AIEngine {
+    cv::dnn::Net net;
+    bool isLoaded = false;
+    int inputWidth = 640;
+    int inputHeight = 640;
+public:
+    bool LoadModel(const std::string& modelPath) {
+        try {
+            net = cv::dnn::readNetFromONNX(modelPath);
+            net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+            net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+            isLoaded = true;
+            LogInfo("AI Model Loaded Successfully: " + modelPath);
+            return true;
+        } catch (const std::exception& e) {
+            LogError("Failed to load AI model: " + std::string(e.what()));
+            isLoaded = false;
+            return false;
+        }
+    }
+
+    bool IsLoaded() const { return isLoaded; }
+
+    std::vector<AIDetection> Detect(cv::Mat& frame, float confThresh, float nmsThresh) {
+        std::vector<AIDetection> detections;
+        if (!isLoaded) return detections;
+
+        cv::Mat blob;
+        cv::dnn::blobFromImage(frame, blob, 1.0 / 255.0, cv::Size(inputWidth, inputHeight), cv::Scalar(), true, false);
+        net.setInput(blob);
+        cv::Mat outputs = net.forward();
+
+        cv::Mat outputMat(outputs.size[1], outputs.size[2], CV_32F, outputs.ptr<float>());
+        cv::transpose(outputMat, outputMat);
+
+        std::vector<int> classIds;
+        std::vector<float> confidences;
+        std::vector<cv::Rect> boxes;
+
+        float xFactor = (float)frame.cols / inputWidth;
+        float yFactor = (float)frame.rows / inputHeight;
+
+        for (int i = 0; i < outputMat.rows; ++i) {
+            float* row = outputMat.ptr<float>(i);
+            
+            // For 1 class (enemy), row[4] is the confidence
+            float confidence = row[4]; 
+            if (confidence < confThresh) continue;
+
+            float cx = row[0];
+            float cy = row[1];
+            float w = row[2];
+            float h = row[3];
+
+            int left = int((cx - 0.5 * w) * xFactor);
+            int top = int((cy - 0.5 * h) * yFactor);
+            int width = int(w * xFactor);
+            int height = int(h * yFactor);
+
+            boxes.push_back(cv::Rect(left, top, width, height));
+            confidences.push_back(confidence);
+            classIds.push_back(0);
+        }
+
+        std::vector<int> indices;
+        cv::dnn::NMSBoxes(boxes, confidences, confThresh, nmsThresh, indices);
+
+        for (int idx : indices) {
+            detections.push_back({boxes[idx], confidences[idx]});
+        }
+
+        return detections;
+    }
+};
+
+// =====================================================================
+//  CAPTURE ENGINE
 // =====================================================================
 enum class CaptureStatus { Success, Timeout, AccessLost, DeviceLost, Error, InvalidROI };
 
@@ -133,7 +234,7 @@ public:
         Cleanup();
         D3D_FEATURE_LEVEL fl;
         HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, device.GetAddressOf(), &fl, context.GetAddressOf());
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) { LogError("D3D11CreateDevice failed", hr); return false; }
 
         ComPtr<IDXGIDevice> dxgiDevice; hr = device.As(&dxgiDevice); if (FAILED(hr)) return false;
         ComPtr<IDXGIAdapter> dxgiAdapter; hr = dxgiDevice->GetParent(__uuidof(IDXGIAdapter), (void**)dxgiAdapter.GetAddressOf()); if (FAILED(hr)) return false;
@@ -142,6 +243,7 @@ public:
 
         hr = dxgiOutput1->DuplicateOutput(device.Get(), deskDupl.GetAddressOf());
         if (SUCCEEDED(hr)) { initialized = true; return true; }
+        LogError("DuplicateOutput failed", hr);
         return false;
     }
 
@@ -269,8 +371,8 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         }
 
         char buf[256];
-        snprintf(buf, sizeof(buf), "FPS %.0f | R %d | LIFT %d | SPD %.2f | TARGET:%c ALT:%c FIRE:%c",
-                 s.fps, s.radius, s.lift, s.aimSpd, s.red ? 'Y' : 'N', s.alt ? 'Y' : 'N', s.firing ? 'Y' : 'N');
+        snprintf(buf, sizeof(buf), "FPS %.0f | R %d | LIFT %d | SPD %.2f | AI:%.0f%% | ALT:%c | FIRE:%c",
+                 s.fps, s.radius, s.lift, s.aimSpd, s.confidence * 100, s.alt ? 'Y' : 'N', s.firing ? 'Y' : 'N');
         SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, color);
         TextOutA(hdc, 20, 20, buf, (int)strlen(buf));
         EndPaint(hwnd, &ps); return 0;
@@ -324,20 +426,28 @@ BOOL WINAPI ConsoleHandler(DWORD sig) {
 // =====================================================================
 int main() {
     SetProcessDPIAware(); SetConsoleCtrlHandler(ConsoleHandler, TRUE);
-    std::cout << "[+] Modark Aimbot v77 - Red + Motion (Inside Circle)\n";
+    LogInfo("Modark Aimbot v79 - YOLOv8 Full Release");
 
     Config cfg = LoadConfig("aimbot.ini");
     g_circleRadius.store(cfg.circleRadius); g_aimSpeed.store(cfg.aimSpeed);
     g_headOffset.store(cfg.headOffset); g_liftValue.store(cfg.liftValue);
-    g_liftIntervalMs.store(cfg.liftIntervalMs); g_minRedArea.store(cfg.minRedArea);
-    g_minMotionPixels.store(cfg.minMotionPixels);
+    g_liftIntervalMs.store(cfg.liftIntervalMs); g_confThreshold.store(cfg.confThreshold);
+    g_nmsThreshold.store(cfg.nmsThreshold);
+
+    AIEngine ai;
+    // تأكد أن ملف best.onnx في نفس المجلد
+    if (!ai.LoadModel("best.onnx")) {
+        LogError("FATAL: Could not load 'best.onnx'. Place it next to the exe.");
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        return 1;
+    }
 
     std::thread overlay(OverlayThread);
     while (g_overlayState.load() == 0) std::this_thread::sleep_for(milliseconds(10));
-    if (g_overlayState.load() == -1) return 1;
+    if (g_overlayState.load() == -1) { LogError("Overlay init failed."); return 1; }
 
     DXGICaptureEngine capture;
-    while (g_appRunning.load() && !capture.Init()) std::this_thread::sleep_for(std::chrono::seconds(1));
+    while (g_appRunning.load() && !capture.Init()) { LogInfo("Retrying D3D11..."); std::this_thread::sleep_for(std::chrono::seconds(1)); }
     if (!capture.IsInitialized()) { g_appRunning.store(false); if (overlay.joinable()) overlay.join(); return 1; }
 
     Hotkeys hk;
@@ -352,19 +462,14 @@ int main() {
     auto targetAcquiredTime = Clock::now();
     bool wasTargetDetected = false; int currentHumanDelay = 30;
 
-    cv::Mat hsv, bgr, gray, prevGray, diff, motionMask, circleMask, m1, m2, redMask, finalRed;
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
-    std::vector<std::vector<cv::Point>> redContours;
+    cv::Mat bgr, circleMask;
     int lastMaskRadius = -1;
-
     float accumX = 0.0f, accumY = 0.0f;
 
     auto processor = [&](cv::Mat& mappedMat, bool isRGBA, int realCx, int realCy) {
         
         if (isRGBA) cv::cvtColor(mappedMat, bgr, cv::COLOR_RGBA2BGR);
         else        cv::cvtColor(mappedMat, bgr, cv::COLOR_BGRA2BGR);
-        cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
-        cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
 
         int radius = g_circleRadius.load();
 
@@ -374,57 +479,26 @@ int main() {
             lastMaskRadius = radius;
         }
 
-        // 1. RED MASK (Strictly inside green circle)
-        cv::inRange(hsv, cv::Scalar(0, 120, 100),   cv::Scalar(10, 255, 255), m1);
-        cv::inRange(hsv, cv::Scalar(170, 120, 100), cv::Scalar(180, 255, 255), m2);
-        cv::bitwise_or(m1, m2, redMask);
-        cv::bitwise_and(redMask, circleMask, finalRed); // Restrict to circle
-        cv::morphologyEx(finalRed, finalRed, cv::MORPH_OPEN, kernel);
-
-        // 2. MOTION MASK
-        if (prevGray.empty() || prevGray.size() != gray.size()) {
-            gray.copyTo(prevGray);
-            return; // Skip first frame
-        }
-        cv::absdiff(gray, prevGray, diff);
-        cv::threshold(diff, motionMask, 25, 255, cv::THRESH_BINARY);
-        gray.copyTo(prevGray);
-
-        cv::findContours(finalRed, redContours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+        // AI Detection on masked image
+        std::vector<AIDetection> detections = ai.Detect(bgr, g_confThreshold.load(), g_nmsThreshold.load());
 
         bool targetFound = false;
         cv::Rect bestRect;
+        float bestConf = 0.0f;
         double minDist = 999999;
-        std::string logReason = "No Red in Circle";
 
-        for (auto& c : redContours) {
-            if (cv::contourArea(c) < g_minRedArea.load()) continue;
+        for (auto& det : detections) {
+            // Only accept boxes inside the circle
+            cv::Point center(det.box.x + det.box.width/2, det.box.y + det.box.height/2);
+            double distToCenter = std::hypot(center.x - realCx, center.y - realCy);
             
-            cv::Rect rect = cv::boundingRect(c);
-            
-            // Strictly check motion inside this red contour
-            cv::Mat contourMask = cv::Mat::zeros(redMask.size(), CV_8UC1);
-            cv::drawContours(contourMask, std::vector<std::vector<cv::Point>>{c}, -1, cv::Scalar(255), -1);
-            
-            cv::Mat intersection;
-            cv::bitwise_and(contourMask, motionMask, intersection);
-            int motionPixels = cv::countNonZero(intersection);
+            if (distToCenter > radius) continue; // Outside green circle
 
-            if (motionPixels < g_minMotionPixels.load()) {
-                logReason = "Red but Static";
-                continue; // Must be moving
-            }
-
-            // Shape is just a bonus for logging, not a blocker
-            float aspect = (float)rect.height / (float)rect.width;
-            bool isShape = (aspect >= 1.2f && aspect <= 4.5f);
-
-            double dist = std::hypot((rect.x + rect.width / 2) - realCx, (rect.y + rect.height / 2) - realCy);
-            if (dist < minDist) { 
-                minDist = dist; 
-                bestRect = rect; 
+            if (distToCenter < minDist) { 
+                minDist = distToCenter; 
+                bestRect = det.box; 
+                bestConf = det.confidence;
                 targetFound = true; 
-                logReason = isShape ? "Locked (Shape + Moving)" : "Locked (Moving, No Shape)";
             }
         }
 
@@ -432,17 +506,31 @@ int main() {
         auto now = Clock::now();
         if (targetFound) lastTargetSeen = now;
 
-        // Logging
+        // =================================================================
+        // EXTENSIVE DEBUG LOGGING (Prints every 500ms)
+        // =================================================================
         if (duration_cast<milliseconds>(now - lastLogTick).count() > 500) {
             if (targetFound) {
-                std::cout << "[DEBUG] " << logReason << " | Box: " << bestRect.width << "x" << bestRect.height << "\n";
+                std::cout << "[DEBUG] AI Target Locked! Conf: " << (int)(bestConf*100) << "% | ";
             } else {
-                std::cout << "[DEBUG] " << logReason << "\n";
+                std::cout << "[DEBUG] Searching... No AI Target in circle. | ";
             }
+            
+            std::cout << "ALT: " << (g_isAltPressed.load() ? "ON" : "OFF");
+            
+            if (!targetFound) std::cout << " -> (Waiting for target)";
+            else if (!g_isAltPressed.load()) std::cout << " -> (Holding fire, press ALT)";
+            else if (!g_isFiring.load()) std::cout << " -> (Waiting for human delay)";
+            else std::cout << " -> (FIRING)";
+            
+            std::cout << "\n";
             lastLogTick = now;
         }
+        // =================================================================
 
         auto sinceTarget = duration_cast<milliseconds>(now - lastTargetSeen).count();
+        
+        // FIRE ONLY IF ALT IS HELD AND TARGET FOUND
         bool shouldFire = g_isAltPressed.load() && (targetFound || sinceTarget < 50);
 
         if (targetFound) {
@@ -454,6 +542,7 @@ int main() {
             int jitterX = jitterDist(rng);
             int jitterY = jitterDist(rng);
             
+            // Aim at 15% from the top (head area)
             int headX = bestRect.x + bestRect.width / 2 + jitterX;
             int headY = bestRect.y + (int)(bestRect.height * 0.15f) + g_headOffset.load() + jitterY;
             
@@ -516,6 +605,7 @@ int main() {
             std::lock_guard<std::mutex> lk(g_statusMutex);
             g_status.red = targetFound; g_status.alt = g_isAltPressed.load(); g_status.firing = g_isFiring.load();
             g_status.radius = radius; g_status.lift = g_liftValue.load(); g_status.aimSpd = g_aimSpeed.load(); g_status.fps = g_fps.load();
+            g_status.confidence = bestConf;
             
             if (targetFound) {
                 g_status.boxX = bestRect.x; g_status.boxY = bestRect.y;
@@ -524,7 +614,7 @@ int main() {
         }
     };
 
-    std::cout << "[+] Engine live. Check console for Debug info.\n";
+    LogInfo("Engine live. AI is looking for enemies. Check console for details.");
 
     while (g_appRunning.load()) {
         auto now = Clock::now();
@@ -547,11 +637,13 @@ int main() {
         CaptureStatus st = capture.GrabFrameAndProcess(radius, processor);
         
         if (st == CaptureStatus::AccessLost) {
+            LogError("Capture access lost. Re-initializing...");
             capture.Cleanup(); std::this_thread::sleep_for(milliseconds(500));
             while (g_appRunning.load() && !capture.Init()) std::this_thread::sleep_for(std::chrono::seconds(1));
         } 
         else if (st == CaptureStatus::DeviceLost) {
-            capture.Cleanup(); std::this_thread::sleep_for(milliseconds(2000));
+            LogError("D3D11 Device Lost. Rebuilding...");
+            capture.Cleanup(); std::this_thread::sleep_for(std::chrono::milliseconds(2000));
             while (g_appRunning.load() && !capture.Init()) std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         else if (st == CaptureStatus::Success) { std::this_thread::yield(); } 
