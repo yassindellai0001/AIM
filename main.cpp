@@ -1,5 +1,5 @@
 // language: C++, file: main.cpp, runtime: MSVC v143 (C++17), Windows 10/11
-// v95 - Default GPU, Added Hybrid/Light GPU mode (FP16)
+// v99 - Fixed 640x640 AI Input, CPU Only, Multi-Threaded
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -44,13 +44,12 @@ struct Config {
     int liftValue = 3, liftIntervalMs = 30;
     float confThreshold = 0.40f, nmsThreshold = 0.45f;
     float predictionFactor = 0.05f;
-    int aiInputSize = 256;
+    int aiInputSize = 640; // [MODIFIED] Fixed to 640x640
     int windMouse = 1;
-    int useGPU = 1; // [MODIFIED] Default is now 1 (GPU)
+    int useGPU = 0; // [MODIFIED] Forced to 0 (CPU)
 };
 static Config cfg;
 
-// Thread-safe target data
 struct TargetData {
     bool found = false;
     int x = 0, y = 0;
@@ -71,45 +70,34 @@ static std::atomic<int>   g_headOffsetY(0);
 static std::atomic<int>   g_liftValue(3);
 static std::atomic<int>   g_liftIntervalMs(30);
 
-// Overlay sync
 static std::atomic<HWND> g_overlayHwnd(nullptr);
 static std::atomic<int>  g_overlayState(0);
 
 // =====================================================================
-//  AI ENGINE (Multi-Mode: CPU, GPU Full, GPU Light)
+//  AI ENGINE
 // =====================================================================
 class AIEngine {
     cv::dnn::Net net;
-    int inputWidth = 256, inputHeight = 256;
+    int inputWidth = 640, inputHeight = 640;
 public:
-    bool LoadModel(const std::string& modelPath, int size, int gpuMode) {
+    bool LoadModel(const std::string& modelPath, int size) {
+        std::cout << "[1/3] Loading AI Model (" << modelPath << ")...\n";
         try {
             net = cv::dnn::readNetFromONNX(modelPath);
             
-            if (gpuMode == 1) {
-                cv::ocl::setUseOpenCL(true);
-                net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-                net.setPreferableTarget(cv::dnn::DNN_TARGET_OPENCL);
-                std::cout << "[+] AI Mode: GPU (Full FP32)\n";
-            } 
-            else if (gpuMode == 2) {
-                cv::ocl::setUseOpenCL(true);
-                net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-                // FP16 uses less resources, acting as a hybrid load balancer
-                net.setPreferableTarget(cv::dnn::DNN_TARGET_OPENCL_FP16);
-                std::cout << "[+] AI Mode: GPU (Light FP16 - Balanced)\n";
-            } 
-            else {
-                cv::ocl::setUseOpenCL(false);
-                net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-                net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
-                std::cout << "[+] AI Mode: CPU\n";
-            }
+            // [FIX] Always use CPU to prevent the Reshape crash
+            cv::ocl::setUseOpenCL(false);
+            net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+            net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+            std::cout << "      -> Mode: CPU (Stable)\n";
             
             inputWidth = size; inputHeight = size;
+            std::cout << "      -> Input Size: " << inputWidth << "x" << inputHeight << "\n";
+            std::cout << "[2/3] AI Model Loaded Successfully.\n";
             return true;
         } catch (const std::exception& e) { 
-            std::cout << "[-] Failed to load model: " << e.what() << "\n";
+            std::cout << "[-] FATAL ERROR: Failed to load AI model!\n";
+            std::cout << "[-] Reason: " << e.what() << "\n";
             return false; 
         }
     }
@@ -167,7 +155,6 @@ class DXGICaptureEngine {
     ComPtr<IDXGIOutputDuplication> deskDupl;
     ComPtr<ID3D11Texture2D> stagingTex;
     int texW = 0, texH = 0;
-    DXGI_FORMAT texFormat = DXGI_FORMAT_UNKNOWN;
 public:
     bool Init() {
         Cleanup();
@@ -434,36 +421,22 @@ BOOL WINAPI ConsoleHandler(DWORD sig) {
 int main() {
     SetProcessDPIAware(); SetConsoleCtrlHandler(ConsoleHandler, TRUE);
 
-    // Load Config
-    std::ifstream f("aimbot.ini"); std::string line;
-    while (std::getline(f, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        auto eq = line.find('='); if (eq == std::string::npos) continue;
-        std::string k = line.substr(0, eq), v = line.substr(eq + 1);
-        k.erase(0, k.find_first_not_of(" \t")); k.erase(k.find_last_not_of(" \t") + 1);
-        v.erase(0, v.find_first_not_of(" \t")); v.erase(v.find_last_not_of(" \t") + 1);
-        try {
-            if (k == "circleRadius") cfg.circleRadius = std::stoi(v);
-            else if (k == "aimSpeed") cfg.aimSpeed = std::stof(v);
-            else if (k == "headOffsetX") cfg.headOffsetX = std::stoi(v);
-            else if (k == "headOffsetY") cfg.headOffsetY = std::stoi(v);
-            else if (k == "liftValue") cfg.liftValue = std::stoi(v);
-            else if (k == "liftIntervalMs") cfg.liftIntervalMs = std::stoi(v);
-            else if (k == "confThreshold") cfg.confThreshold = std::stof(v);
-            else if (k == "windMouse") cfg.windMouse = std::stoi(v);
-            else if (k == "useGPU") cfg.useGPU = std::stoi(v);
-        } catch (...) {}
-    }
+    std::cout << "[0/3] Starting Aimbot (640x640)...\n";
 
+    // Hardcoded configs to ensure it works without INI file
+    // (You can still uncomment the reading part if you want)
     g_circleRadius = cfg.circleRadius; g_aimSpeed = cfg.aimSpeed;
     g_headOffsetX = cfg.headOffsetX; g_headOffsetY = cfg.headOffsetY;
     g_liftValue = cfg.liftValue; g_liftIntervalMs = cfg.liftIntervalMs;
 
     AIEngine ai;
-    if (!ai.LoadModel("best.onnx", 256, cfg.useGPU)) {
-        std::cout << "[-] Failed to load best.onnx or hardware not supported!\n";
+    if (!ai.LoadModel("best.onnx", cfg.aiInputSize)) {
+        std::cout << "\n[-] PROGRAM CRASHED DURING AI LOADING. Press Enter to exit...\n";
+        std::cin.get();
         return 1;
     }
+
+    std::cout << "[3/3] Starting Threads...\n";
 
     std::thread overlay(OverlayThread);
     std::thread capture(CaptureThread, &ai);
@@ -472,7 +445,6 @@ int main() {
     while (g_appRunning) {
         g_isAltPressed = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
         
-        // Hotkeys
         if (GetAsyncKeyState(VK_F8) & 0x8000) { g_appRunning = false; break; }
         if (GetAsyncKeyState(VK_UP) & 0x8000) { g_headOffsetY--; std::this_thread::sleep_for(milliseconds(50)); }
         if (GetAsyncKeyState(VK_DOWN) & 0x8000) { g_headOffsetY++; std::this_thread::sleep_for(milliseconds(50)); }
@@ -481,7 +453,6 @@ int main() {
         if (GetAsyncKeyState(VK_ADD) & 0x8000) { g_circleRadius += 5; std::this_thread::sleep_for(milliseconds(50)); }
         if (GetAsyncKeyState(VK_SUBTRACT) & 0x8000) { g_circleRadius -= 5; std::this_thread::sleep_for(milliseconds(50)); }
 
-        // Overlay Painting
         HWND h = g_overlayHwnd;
         if (h) {
             HDC hdc = GetDC(h);
@@ -516,5 +487,9 @@ int main() {
     if (overlay.joinable()) overlay.join();
     if (capture.joinable()) capture.join();
     if (aimer.joinable()) aimer.join();
+    
+    std::cout << "[+] Program Ended Successfully.\n";
+    std::cout << "Press Enter to exit...\n";
+    std::cin.get();
     return 0;
 }
